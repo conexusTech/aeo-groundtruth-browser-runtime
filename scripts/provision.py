@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -451,44 +452,43 @@ def main() -> int:
     try:
         arn = ensure_runtime(container_uri, role_arn, check=False)
     except ClientError as exc:
-        message = str(exc)
-        if "iam:PassRole" not in message and "PassRole" not in message:
+        code = exc.response["Error"]["Code"]
+        if code not in ("AccessDenied", "AccessDeniedException"):
             raise
-        # Called out separately because it is the one permission that cannot be
-        # discovered earlier: PassRole is evaluated by CreateAgentRuntime, so a run can
-        # build and push a whole image before hitting it. Failing here with a generic
-        # AccessDenied would read as "AgentCore access is missing" and send someone
-        # after the wrong grant.
+        # Generalized from a PassRole-only special case, because the first real run of
+        # this script proved the assumption behind that wrong: it failed on
+        # `bedrock-agentcore:CreateAgentRuntimeEndpoint`, an action nobody had listed,
+        # because CreateAgentRuntime implicitly creates a DEFAULT endpoint. The lesson is
+        # that the set of actions a single API call authorizes is not knowable from its
+        # name, so this reports whatever AWS actually named rather than what we predicted.
+        message = str(exc)
+        match = re.search(r"not authorized to perform:\s*(\S+)", message)
+        action = match.group(1) if match else "(see the message below)"
         print()
         print("=" * 78)
-        print("BLOCKED on iam:PassRole - everything else worked.")
+        print(f"BLOCKED on {action} - everything before this step worked.")
         print()
-        print("The image is pushed and the role exists; CreateAgentRuntime hands that")
-        print("role to AgentCore, and THIS identity must be allowed to do the handing.")
-        print("Creating the role is not enough on its own. Ask for:")
+        print("The image is pushed and the execution role exists. This is the LAST step,")
+        print("and it is the only one that authorizes several actions at once, so a")
+        print("missing permission surfaces here rather than in the permission checker.")
+        print()
+        print("Ask for this statement, then re-run - nothing above has to be redone:")
         print("=" * 78)
-        print(
-            json.dumps(
-                {
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Sid": "PassTheRuntimeRoleToAgentCoreOnly",
-                            "Effect": "Allow",
-                            "Action": "iam:PassRole",
-                            "Resource": role_arn,
-                            "Condition": {
-                                "StringEquals": {
-                                    "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
-                                }
-                            },
-                        }
-                    ],
-                },
-                indent=2,
-            )
+        resource = (
+            role_arn
+            if action.startswith("iam:")
+            else f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/*"
         )
+        statement: dict = {"Effect": "Allow", "Action": action, "Resource": resource}
+        if action == "iam:PassRole":
+            statement["Condition"] = {
+                "StringEquals": {"iam:PassedToService": "bedrock-agentcore.amazonaws.com"}
+            }
+        print(json.dumps({"Version": "2012-10-17", "Statement": [statement]}, indent=2))
         print("=" * 78)
+        print()
+        print("Full message, in case it names more than one thing:")
+        print(f"  {message}")
         return 2
     print()
     print("Set this in aeo-agent-service's .env:")

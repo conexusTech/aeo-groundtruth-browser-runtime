@@ -115,7 +115,11 @@ secrets. It grants nothing over the existing `aeoskills` runtimes or any other r
         "bedrock-agentcore:GetAgentRuntime",
         "bedrock-agentcore:ListAgentRuntimes",
         "bedrock-agentcore:InvokeAgentRuntime",
-        "bedrock-agentcore:TagResource"
+        "bedrock-agentcore:TagResource",
+        "bedrock-agentcore:CreateAgentRuntimeEndpoint",
+        "bedrock-agentcore:UpdateAgentRuntimeEndpoint",
+        "bedrock-agentcore:GetAgentRuntimeEndpoint",
+        "bedrock-agentcore:ListAgentRuntimeEndpoints"
       ],
       "Resource": "*"
     },
@@ -144,6 +148,14 @@ Two entries are not resource-scoped, and they are the ones worth questioning:
   cannot be scoped to it in advance. After the first create, the Get/Update/Invoke
   actions can be tightened to
   `arn:aws:bedrock-agentcore:us-east-1:082585646836:runtime/aeo_groundtruth_browser-*`.
+
+> **The four `*AgentRuntimeEndpoint` actions were added after a real deploy attempt.**
+> `CreateAgentRuntime` implicitly creates a `DEFAULT` endpoint, so it authorizes
+> `CreateAgentRuntimeEndpoint` as well — which is not inferable from the API's name and
+> is not listed in AWS's own example policy. Everything else succeeded (repository
+> created, ARM64 image pushed, `iam:PassRole` accepted) and only this last call failed.
+> The other three are included because the same relationship applies on redeploy and on
+> invoking a specific qualifier, and discovering each one costs another round trip.
 
 ### Alternative: you run the whole thing once, we get nothing
 

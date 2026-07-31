@@ -180,10 +180,31 @@ def main() -> int:
         )
     )
     results.append(
+        probe(
+            "bedrock-agentcore:ListAgentRuntimeEndpoints",
+            lambda: control.list_agent_runtime_endpoints(agentRuntimeId=missing_runtime),
+        )
+    )
+    results.append(
+        probe(
+            "bedrock-agentcore:GetAgentRuntimeEndpoint",
+            lambda: control.get_agent_runtime_endpoint(
+                agentRuntimeId=missing_runtime, endpointName="DEFAULT"
+            ),
+        )
+    )
+    results.append(
         (
             "bedrock-agentcore:CreateAgentRuntime",
             UNKNOWN,
             "not probed: a probe that got past authorization could create a real runtime",
+        )
+    )
+    results.append(
+        (
+            "bedrock-agentcore:CreateAgentRuntimeEndpoint",
+            UNKNOWN,
+            "same - and note CreateAgentRuntime authorizes this one too, implicitly",
         )
     )
 

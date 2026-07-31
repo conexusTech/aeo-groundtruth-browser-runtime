@@ -36,7 +36,14 @@ REGION = "us-east-1"  # Where this account's existing AgentCore runtimes live.
 ACCOUNT = "082585646836"
 ECR_REPO = "aeo-groundtruth/browser"
 IMAGE_TAG = "latest"
-ROLE_NAME = "AEOGroundTruthBrowserRuntimeRole"
+#: Prefixed `AmazonBedrockAgentCore` DELIBERATELY, and it is not cosmetic.
+#:
+#: AWS's own documented AgentCore policy scopes `iam:PassRole` to
+#: `arn:aws:iam::*:role/AmazonBedrockAgentCore*` and its role-management statement to
+#: `*BedrockAgentCore*`. A role named anything else needs a bespoke policy written and
+#: reviewed; this name is covered by the statements an administrator has probably already
+#: approved elsewhere. Renaming it makes the access request harder to grant, not tidier.
+ROLE_NAME = "AmazonBedrockAgentCoreAEOGroundTruthBrowserRole"
 RUNTIME_NAME = "aeo_groundtruth_browser"
 
 #: Secrets this runtime may read. Scoped to the naming convention aeo-agent-service
@@ -91,26 +98,96 @@ PERMISSION_POLICY = {
             ),
         },
         {
+            "Sid": "EcrTokenCannotBeScoped",
+            "Effect": "Allow",
+            "Action": "ecr:GetAuthorizationToken",
+            "Resource": "*",
+        },
+        {
             "Sid": "PullTheRuntimeImage",
             "Effect": "Allow",
+            "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+            "Resource": f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/*",
+        },
+        # The four log statements below are AWS's documented shape for an AgentCore
+        # execution role, not ours. An earlier version of this file collapsed them into
+        # one and omitted `logs:PutResourcePolicy` and `logs:DescribeLogGroups`
+        # entirely, which the docs require — and the cost of getting it wrong is a
+        # runtime that deploys and then has no logs, on a QUARTERLY path where the next
+        # chance to notice is three months away.
+        {
+            "Sid": "LogGroups",
+            "Effect": "Allow",
+            "Action": ["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+            "Resource": (
+                f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:"
+                "/aws/bedrock-agentcore/runtimes/*"
+            ),
+        },
+        {
+            "Sid": "LogResourcePolicy",
+            "Effect": "Allow",
+            "Action": ["logs:PutResourcePolicy"],
+            "Resource": (
+                f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:"
+                f"/aws/bedrock-agentcore/runtimes/{RUNTIME_NAME}-*"
+            ),
+        },
+        {
+            "Sid": "DescribeLogGroupsIsAccountWide",
+            "Effect": "Allow",
+            "Action": ["logs:DescribeLogGroups"],
+            "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:*",
+        },
+        {
+            "Sid": "LogStreams",
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": (
+                f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:"
+                "/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+            ),
+        },
+        {
+            "Sid": "Observability",
+            "Effect": "Allow",
             "Action": [
-                "ecr:GetAuthorizationToken",
-                "ecr:BatchGetImage",
-                "ecr:GetDownloadUrlForLayer",
+                "xray:PutTraceSegments",
+                "xray:PutTelemetryRecords",
+                "xray:GetSamplingRules",
+                "xray:GetSamplingTargets",
             ],
             "Resource": "*",
         },
         {
-            "Sid": "Logs",
+            "Sid": "Metrics",
+            "Effect": "Allow",
+            "Action": "cloudwatch:PutMetricData",
+            "Resource": "*",
+            "Condition": {"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}},
+        },
+        {
+            # The platform creates a workload identity for every runtime (visible as
+            # `workloadIdentityDetails` on the existing aeoskills runtimes). Scoped to
+            # this runtime's own identity: we use no inbound/outbound OAuth, so the
+            # broader `ForUserId` variant AWS warns about is not granted.
+            "Sid": "OwnWorkloadIdentityOnly",
             "Effect": "Allow",
             "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents",
-                "logs:DescribeLogStreams",
+                "bedrock-agentcore:GetWorkloadAccessToken",
+                "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
             ],
-            "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aws/bedrock-agentcore/*",
+            "Resource": [
+                f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:"
+                "workload-identity-directory/default",
+                f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:"
+                f"workload-identity-directory/default/workload-identity/{RUNTIME_NAME}-*",
+            ],
         },
+        # NOT granted, deliberately: `bedrock:InvokeModel`. AWS's template includes it
+        # because most runtimes are LLM agents. This one drives a browser and calls no
+        # model — the extraction LLM lives in aeo-agent-service, on the tenant's own
+        # credentials — so granting it here would be authority with no caller.
     ],
 }
 
@@ -190,8 +267,20 @@ def build_and_push(repo_uri: str) -> str:
     return f"{repo_uri}@{digest}"
 
 
-def ensure_role(check: bool) -> str | None:
-    """Create the runtime execution role, or explain what to ask for."""
+def ensure_role(check: bool, supplied_arn: str | None = None) -> str | None:
+    """Create the runtime execution role, or explain what to ask for.
+
+    `supplied_arn` (--role-arn) skips IAM entirely, which is the normal path when an
+    administrator created the role for us: this script then needs NO IAM permission of
+    its own. Note that `iam:PassRole` on that role is still required — but it is
+    consumed by `CreateAgentRuntime`, not by anything here, so its absence surfaces at
+    the very last step. `main` warns about that up front rather than letting a run get
+    all the way to the end before failing.
+    """
+    if supplied_arn:
+        print(f"[iam] using the role supplied on the command line: {supplied_arn}")
+        return supplied_arn
+
     iam = boto3.client("iam")
     arn = f"arn:aws:iam::{ACCOUNT}:role/{ROLE_NAME}"
     try:
@@ -201,8 +290,13 @@ def ensure_role(check: bool) -> str | None:
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
         if code == "AccessDenied":
-            # Expected in this account: leo.lindo cannot read IAM roles.
-            print("[iam] cannot READ roles (AccessDenied) - assuming it must be created")
+            # Expected in this account: leo.lindo cannot read IAM roles. Note this is
+            # NOT evidence the role is absent, only that we cannot see it — so if an
+            # admin has already created it, pass --role-arn instead of letting the
+            # create attempt below fail with EntityAlreadyExists.
+            print("[iam] cannot READ roles (AccessDenied); cannot tell if it exists")
+            print("      If an administrator already created it, re-run with:")
+            print(f"      --role-arn {arn}")
         elif code not in ("NoSuchEntity", "ValidationError"):
             raise
 
@@ -294,11 +388,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="read-only inventory")
     parser.add_argument("--skip-push", action="store_true", help="do not rebuild/push")
+    parser.add_argument(
+        "--role-arn",
+        help=(
+            "use an execution role an administrator already created, instead of "
+            "creating one. Skips IAM entirely, so no IAM permission is needed here - "
+            "but iam:PassRole on that role is still required by CreateAgentRuntime."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"account={ACCOUNT} region={REGION}\n")
     repo_uri = ensure_ecr(args.check)
-    role_arn = ensure_role(args.check)
+    role_arn = ensure_role(args.check, args.role_arn)
 
     container_uri = f"{repo_uri}:{IMAGE_TAG}" if repo_uri else ""
     if not args.check and not args.skip_push and repo_uri:
@@ -321,7 +423,48 @@ def main() -> int:
         print("Hand docs/PERMISSIONS-REQUEST.md to whoever administers this account.")
         return 2
 
-    arn = ensure_runtime(container_uri, role_arn, check=False)
+    try:
+        arn = ensure_runtime(container_uri, role_arn, check=False)
+    except ClientError as exc:
+        message = str(exc)
+        if "iam:PassRole" not in message and "PassRole" not in message:
+            raise
+        # Called out separately because it is the one permission that cannot be
+        # discovered earlier: PassRole is evaluated by CreateAgentRuntime, so a run can
+        # build and push a whole image before hitting it. Failing here with a generic
+        # AccessDenied would read as "AgentCore access is missing" and send someone
+        # after the wrong grant.
+        print()
+        print("=" * 78)
+        print("BLOCKED on iam:PassRole - everything else worked.")
+        print()
+        print("The image is pushed and the role exists; CreateAgentRuntime hands that")
+        print("role to AgentCore, and THIS identity must be allowed to do the handing.")
+        print("Creating the role is not enough on its own. Ask for:")
+        print("=" * 78)
+        print(
+            json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "PassTheRuntimeRoleToAgentCoreOnly",
+                            "Effect": "Allow",
+                            "Action": "iam:PassRole",
+                            "Resource": role_arn,
+                            "Condition": {
+                                "StringEquals": {
+                                    "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
+                                }
+                            },
+                        }
+                    ],
+                },
+                indent=2,
+            )
+        )
+        print("=" * 78)
+        return 2
     print()
     print("Set this in aeo-agent-service's .env:")
     print(f"  AGENTCORE_BROWSER_RUNTIME_ARN={arn}")

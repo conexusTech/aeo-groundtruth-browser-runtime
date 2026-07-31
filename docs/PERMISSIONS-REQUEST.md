@@ -30,27 +30,53 @@ deploy. Verified by attempting each call:
 | `iam:GetRole`, `iam:GetPolicy` | AccessDenied |
 | `secretsmanager:ListSecrets` | AccessDenied |
 
-## Two ways to unblock, pick either
+## The recommended split: you keep IAM, we get the rest
 
-### Option A — an admin runs the provisioning script once (no new permissions)
-
-The repo contains an idempotent script that creates everything and prints the runtime
-ARN. Run it with admin credentials:
+**You create the execution role yourself** (§"The runtime's own execution role" below has
+both policies, ready to paste). We then need **no IAM management permissions at all** — no
+`iam:CreateRole`, no `iam:GetRole`, no `iam:PutRolePolicy`. The script takes the role you
+made:
 
 ```bash
-python scripts/provision.py --check   # read-only: shows what is missing
-python scripts/provision.py           # creates ECR repo, IAM role, image, runtime
+python scripts/provision.py --role-arn arn:aws:iam::082585646836:role/AmazonBedrockAgentCoreAEOGroundTruthBrowserRole
 ```
 
-Then send back the ARN it prints. **Nothing else is needed from us**, and Leo keeps
-read-only access. Re-running it later updates the image, so an admin would be needed
-again for each deploy — which is the trade-off against Option B.
+### ⚠️ The one IAM permission that is still required: `iam:PassRole`
 
-### Option B — grant Leo the deploy permissions (self-serve)
+This is the part that is easy to miss, so it is worth being explicit. Creating the role
+is **not sufficient on its own**. `CreateAgentRuntime` *passes* that role to the
+AgentCore service, and AWS evaluates whether the **caller** is allowed to pass it. AWS's
+own documented AgentCore policy carries this statement (`IAMPassRoleAccess`) for exactly
+this reason.
 
-Attach the policy below. It is scoped to this feature's own resources: one ECR
-namespace, one named IAM role, and Bright Data secrets. It grants nothing over the
-existing `aeoskills` runtimes or any other repository.
+Without it, every other step succeeds — repository created, image pushed — and only the
+final call fails, with an error that reads like missing AgentCore access rather than
+missing IAM access.
+
+It is a narrow grant: it permits handing **one named role** to **one service**, and
+nothing else. It cannot be used to assume the role, modify it, or pass it anywhere else.
+
+```json
+{
+  "Sid": "PassTheRuntimeRoleToAgentCoreOnly",
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::082585646836:role/AmazonBedrockAgentCoreAEOGroundTruthBrowserRole",
+  "Condition": {
+    "StringEquals": { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" }
+  }
+}
+```
+
+> The role name begins with `AmazonBedrockAgentCore` on purpose. AWS's documented policy
+> scopes `iam:PassRole` to `arn:aws:iam::*:role/AmazonBedrockAgentCore*`, so this name is
+> already covered by a pattern you may have approved elsewhere, instead of needing a
+> one-off exception.
+
+### The rest of the policy for us
+
+No IAM in here. One ECR namespace, the AgentCore control plane, and this feature's own
+secrets. It grants nothing over the existing `aeoskills` runtimes or any other repository.
 
 ```json
 {
@@ -81,29 +107,6 @@ existing `aeoskills` runtimes or any other repository.
       "Resource": "arn:aws:ecr:us-east-1:082585646836:repository/aeo-groundtruth/*"
     },
     {
-      "Sid": "OneNamedExecutionRole",
-      "Effect": "Allow",
-      "Action": [
-        "iam:CreateRole",
-        "iam:GetRole",
-        "iam:TagRole",
-        "iam:PutRolePolicy",
-        "iam:GetRolePolicy"
-      ],
-      "Resource": "arn:aws:iam::082585646836:role/AEOGroundTruthBrowserRuntimeRole"
-    },
-    {
-      "Sid": "PassThatRoleToAgentCoreOnly",
-      "Effect": "Allow",
-      "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::082585646836:role/AEOGroundTruthBrowserRuntimeRole",
-      "Condition": {
-        "StringEquals": {
-          "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
-        }
-      }
-    },
-    {
       "Sid": "ManageThisRuntimeAndInvokeIt",
       "Effect": "Allow",
       "Action": [
@@ -131,26 +134,42 @@ existing `aeoskills` runtimes or any other repository.
 }
 ```
 
-Notes on the two entries that are not resource-scoped, since those are the ones worth
-questioning:
+Two entries are not resource-scoped, and they are the ones worth questioning:
 
-- **`ecr:GetAuthorizationToken`** does not accept a resource condition in IAM. It
-  returns a registry login token only; it grants no access to any repository by itself.
-  Leo already has it.
+- **`ecr:GetAuthorizationToken`** accepts no resource condition in IAM. It returns a
+  registry login token and grants no access to any repository by itself. Leo already
+  has it.
 - **`bedrock-agentcore:*AgentRuntime`** is `"*"` because a runtime's ARN contains a
-  server-generated suffix that does not exist until it is created, so `CreateAgentRuntime`
-  cannot be scoped to it. It can be tightened to
-  `arn:aws:bedrock-agentcore:us-east-1:082585646836:runtime/aeo_groundtruth_browser-*`
-  for the Get/Update/Invoke actions after the first create, if that is preferred.
+  server-generated suffix that does not exist until creation, so `CreateAgentRuntime`
+  cannot be scoped to it in advance. After the first create, the Get/Update/Invoke
+  actions can be tightened to
+  `arn:aws:bedrock-agentcore:us-east-1:082585646836:runtime/aeo_groundtruth_browser-*`.
+
+### Alternative: you run the whole thing once, we get nothing
+
+If you would rather not grant anything, run the script with your own credentials and send
+back the ARN it prints:
+
+```bash
+python scripts/provision.py --check   # read-only: shows what is missing
+python scripts/provision.py           # ECR repo, IAM role, image build+push, runtime
+```
+
+That works completely, and Leo keeps read-only access. The trade-off is that you are
+needed again for every subsequent deploy, since re-running is how a code change ships.
 
 ## The runtime's own execution role
 
-Separately from the above, the runtime needs an execution role that **AgentCore**
-assumes. `scripts/provision.py` creates it, but here it is for review. This is the role
-that actually opens browser sessions and reads the proxy credentials.
+This is the role **AgentCore** assumes to run the container — the one that opens browser
+sessions and reads the proxy credentials. Create it as
+`AmazonBedrockAgentCoreAEOGroundTruthBrowserRole`.
 
-**Trust policy** — includes both confused-deputy guards, so no AgentCore resource in
-another account can assume it:
+Both documents below are generated from `scripts/provision.py`, so they are exactly what
+the script would create; they will not drift from the code.
+
+**Trust policy** — carries both confused-deputy guards (`aws:SourceAccount` and
+`aws:SourceArn`) as AWS's documentation specifies, so no AgentCore resource in another
+account can assume it:
 
 ```json
 {
@@ -171,9 +190,8 @@ another account can assume it:
 }
 ```
 
-**Permission policy** — the secret access is scoped to the `brightdata-` prefix rather
-than `*` on purpose: the runtime uses exactly one town's credentials per session, so
-read access to every secret in the account is authority it can never legitimately need.
+**Permission policy.** This follows AWS's documented execution-role template, with two
+deliberate differences called out after the JSON.
 
 ```json
 {
@@ -198,29 +216,92 @@ read access to every secret in the account is authority it can never legitimatel
       "Resource": "arn:aws:secretsmanager:us-east-1:082585646836:secret:brightdata-*"
     },
     {
+      "Sid": "EcrTokenCannotBeScoped",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
       "Sid": "PullTheRuntimeImage",
       "Effect": "Allow",
+      "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+      "Resource": "arn:aws:ecr:us-east-1:082585646836:repository/*"
+    },
+    {
+      "Sid": "LogGroups",
+      "Effect": "Allow",
+      "Action": ["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+      "Resource": "arn:aws:logs:us-east-1:082585646836:log-group:/aws/bedrock-agentcore/runtimes/*"
+    },
+    {
+      "Sid": "LogResourcePolicy",
+      "Effect": "Allow",
+      "Action": ["logs:PutResourcePolicy"],
+      "Resource": "arn:aws:logs:us-east-1:082585646836:log-group:/aws/bedrock-agentcore/runtimes/aeo_groundtruth_browser-*"
+    },
+    {
+      "Sid": "DescribeLogGroupsIsAccountWide",
+      "Effect": "Allow",
+      "Action": ["logs:DescribeLogGroups"],
+      "Resource": "arn:aws:logs:us-east-1:082585646836:log-group:*"
+    },
+    {
+      "Sid": "LogStreams",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:082585646836:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+    },
+    {
+      "Sid": "Observability",
+      "Effect": "Allow",
       "Action": [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer"
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "Logs",
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "cloudwatch:namespace": "bedrock-agentcore" }
+      }
+    },
+    {
+      "Sid": "OwnWorkloadIdentityOnly",
       "Effect": "Allow",
       "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
-        "logs:DescribeLogStreams"
+        "bedrock-agentcore:GetWorkloadAccessToken",
+        "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
       ],
-      "Resource": "arn:aws:logs:us-east-1:082585646836:log-group:/aws/bedrock-agentcore/*"
+      "Resource": [
+        "arn:aws:bedrock-agentcore:us-east-1:082585646836:workload-identity-directory/default",
+        "arn:aws:bedrock-agentcore:us-east-1:082585646836:workload-identity-directory/default/workload-identity/aeo_groundtruth_browser-*"
+      ]
     }
   ]
 }
 ```
+
+Where this differs from AWS's template, and why:
+
+- **`bedrock:InvokeModel` is deliberately NOT granted.** AWS's template includes it
+  because most AgentCore runtimes are LLM agents. This one drives a browser and calls no
+  model — the language-model work happens in the calling service on its own credentials —
+  so granting it here would be authority with no caller.
+- **`secretsmanager:GetSecretValue` is scoped to the `brightdata-` prefix**, not `*`. The
+  runtime uses exactly one town's credentials per session, so read access to every secret
+  in the account is authority it can never legitimately need. The trailing `*` covers the
+  six random characters AWS appends to every secret ARN.
+- **`GetWorkloadAccessTokenForUserId` is excluded** while the `ForJWT` variant is kept.
+  AWS's own guidance recommends denying the `ForUserId` form outside development, since it
+  issues tokens from caller-supplied user identifiers with no IdP verification. This
+  runtime uses no inbound or outbound OAuth, so it needs neither, but the pair is left in
+  its documented minimal form rather than removed entirely.
 
 ## Cost, so it is not a surprise
 

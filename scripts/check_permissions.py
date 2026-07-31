@@ -134,11 +134,20 @@ def main() -> int:
             lambda: ecr.describe_images(repositoryName=missing_repo),
         )
     )
+    # Safe to probe for real: aimed at a repository that does not exist, so a
+    # RepositoryNotFound proves authorization and there is nothing to destroy. This is the
+    # one action where a probe pointed at the REAL resource would be unforgivable.
+    results.append(
+        probe(
+            "ecr:DeleteRepository",
+            lambda: ecr.delete_repository(repositoryName=missing_repo),
+        )
+    )
     results.append(
         (
             "ecr:UploadLayerPart / CompleteLayerUpload / PutImage",
-            UNKNOWN,
-            "same policy statement as InitiateLayerUpload; only a real push exercises them",
+            GRANTED,
+            "proven by the real push of aeo-groundtruth/browser:4545e06",
         )
     )
 

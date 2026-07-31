@@ -1,0 +1,9 @@
+# Pinned exactly. This image is deployed to AgentCore Runtime and re-built rarely, so
+# a floating dependency means the thing that changes between a working and a broken
+# ARM64 build is invisible in the diff.
+bedrock-agentcore==1.19.0
+playwright==1.61.0
+boto3==1.43.61
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+pydantic==2.13.4

@@ -35,7 +35,6 @@ from botocore.exceptions import ClientError
 REGION = "us-east-1"  # Where this account's existing AgentCore runtimes live.
 ACCOUNT = "082585646836"
 ECR_REPO = "aeo-groundtruth/browser"
-IMAGE_TAG = "latest"
 #: Prefixed `AmazonBedrockAgentCore` DELIBERATELY, and it is not cosmetic.
 #:
 #: AWS's own documented AgentCore policy scopes `iam:PassRole` to
@@ -197,6 +196,30 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
 
 
+def image_tag() -> str:
+    """Content-identifying tag: the git commit, plus `-dirty` for uncommitted work.
+
+    **Not `latest`, and the repository's immutability is why.** The repo is created with
+    `imageTagMutability=IMMUTABLE`, so re-pushing one fixed tag with different content is
+    rejected outright — a first deploy would have worked and every deploy after it would
+    have failed with an opaque `ImageTagAlreadyExistsException`.
+
+    A commit-derived tag also matches how this account's existing aeoskills runtimes are
+    tagged, and it means the image a quarterly job runs can be traced back to a commit.
+
+    Pushing two DIFFERENT dirty builds in a row still collides, deliberately: the fix is
+    to commit, which is also the only way the deployed image stays identifiable.
+    """
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return f"{sha}-dirty" if dirty else sha
+
+
 def ensure_ecr(check: bool) -> str | None:
     ecr = boto3.client("ecr", region_name=REGION)
     try:
@@ -247,7 +270,9 @@ def build_and_push(repo_uri: str) -> str:
         ["docker", "login", "--username", "AWS", "--password-stdin", registry],
         input=password.encode(),
     )
-    tag = f"{repo_uri}:{IMAGE_TAG}"
+    version = image_tag()
+    print(f"[image] tag={version}")
+    tag = f"{repo_uri}:{version}"
     # --provenance=false: the OCI attestation manifest buildx adds by default makes the
     # pushed artifact a manifest LIST, which AgentCore's image resolution rejects.
     _run(
@@ -260,7 +285,7 @@ def build_and_push(repo_uri: str) -> str:
         ]
     )
     images = boto3.client("ecr", region_name=REGION).describe_images(
-        repositoryName=ECR_REPO, imageIds=[{"imageTag": IMAGE_TAG}]
+        repositoryName=ECR_REPO, imageIds=[{"imageTag": version}]
     )
     digest = images["imageDetails"][0]["imageDigest"]
     print(f"[image] pushed {ECR_REPO}@{digest}")
@@ -402,7 +427,7 @@ def main() -> int:
     repo_uri = ensure_ecr(args.check)
     role_arn = ensure_role(args.check, args.role_arn)
 
-    container_uri = f"{repo_uri}:{IMAGE_TAG}" if repo_uri else ""
+    container_uri = f"{repo_uri}:{image_tag()}" if repo_uri else ""
     if not args.check and not args.skip_push and repo_uri:
         container_uri = build_and_push(repo_uri)
 

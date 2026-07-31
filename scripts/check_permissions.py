@@ -100,16 +100,20 @@ def main() -> int:
     results.append(
         probe("ecr:DescribeRepositories", lambda: ecr.describe_repositories(maxResults=1))
     )
-    # Aimed at a repo name that does not exist, inside the granted namespace: a
-    # RepositoryNotFound proves authorization without creating anything.
+    # Probing a create genuinely requires attempting one, so it targets the REAL
+    # repository this project needs rather than a throwaway name.
+    #
+    # An earlier version used a unique throwaway name and tried to delete it afterwards.
+    # That left a repository behind the first time the grant landed, because
+    # `ecr:DeleteRepository` is deliberately NOT part of the grant - so the probe could
+    # create litter it had no way to remove. Aiming at the real name makes success
+    # useful (the repository is wanted) and makes a second run report
+    # RepositoryAlreadyExists, which is still proof of authorization.
     results.append(
-        probe(
-            "ecr:CreateRepository",
-            # Probing create genuinely requires attempting a create, so this one targets
-            # a throwaway name and is cleaned up below if it succeeds.
-            lambda: ecr.create_repository(repositoryName=missing_repo),
-        )
+        probe("ecr:CreateRepository", lambda: ecr.create_repository(repositoryName=ECR_REPO))
     )
+    # These three are safe against a name that does not exist: RepositoryNotFound proves
+    # authorization. They are pointed at the real repo only so the output is readable.
     results.append(
         probe(
             "ecr:InitiateLayerUpload",
@@ -242,13 +246,12 @@ def main() -> int:
         print(f"execution role: cannot list roles ({exc.response['Error']['Code']})")
 
     # --- clean up anything a probe created -----------------------------------
+    #
+    # No ECR cleanup: the create probe now targets the repository this project actually
+    # wants, so there is nothing to undo. Deleting it would not be possible anyway -
+    # `ecr:DeleteRepository` is not in the grant, which is correct for least privilege
+    # and is exactly why no probe may create a resource it does not want to keep.
     for action, verdict, _ in results:
-        if action == "ecr:CreateRepository" and verdict == GRANTED:
-            try:
-                ecr.delete_repository(repositoryName=missing_repo, force=True)
-                print(f"cleanup: deleted probe repository {missing_repo}")
-            except ClientError as exc:
-                print(f"cleanup: could NOT delete {missing_repo}: {exc}")
         if action == "secretsmanager:CreateSecret" and verdict == GRANTED:
             try:
                 secrets.delete_secret(

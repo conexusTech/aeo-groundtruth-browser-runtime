@@ -1,0 +1,79 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AgentCoreFullServiceAccess",
+      "Effect": "Allow",
+      "Action": "bedrock-agentcore:*",
+      "Resource": "arn:aws:bedrock-agentcore:*:*:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnverifiedWorkloadTokens",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassExecutionRoleToAgentCore",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::082585646836:role/AmazonBedrockAgentCoreAEOGroundTruthBrowserRole",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "bedrock-agentcore.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ReadRolesForProvisioningChecks",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:ListRoles"
+      ],
+      "Resource": "arn:aws:iam::082585646836:role/*"
+    },
+    {
+      "Sid": "EcrLoginToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PushRuntimeImageToOwnNamespace",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:CreateRepository",
+        "ecr:DeleteRepository",
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:ListImages",
+        "ecr:TagResource",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:us-east-1:082585646836:repository/aeo-groundtruth/*"
+    },
+    {
+      "Sid": "BrightDataProxySecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:082585646836:secret:brightdata-*"
+    }
+  ]
+}

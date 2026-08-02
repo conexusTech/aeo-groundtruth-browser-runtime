@@ -218,6 +218,25 @@ Likewise its Secrets Manager grant is scoped to `secret:bedrock-agentcore*`, whi
 **not** cover this feature's `brightdata-<town>-<region>` naming, so
 `ProxyCredentialSecretsForThisFeature` is still required.
 
+#### ⭐ OR: one self-contained policy — `docs/policy-caller.json`
+
+If you would rather apply a single document than attach a managed policy and preserve
+other statements, **`docs/policy-caller.json` is the whole thing** and supersedes every
+JSON block in this file. It folds in the AgentCore access, the ECR push grant the managed
+policy lacks, `iam:PassRole`, the Bright Data secrets, and the recommended `Deny`. Applying
+it alone is sufficient; nothing else in this document needs to be applied as well.
+
+Two notes for whoever reviews it:
+
+- **`bedrock-agentcore:*` on `arn:aws:bedrock-agentcore:*:*:*` is AWS's own resource
+  pattern**, copied verbatim from `BedrockAgentCoreFullAccess` v18 rather than tightened.
+  Tightening the *resource* is what caused the last failure in this file: `CreateAgentRuntime`
+  needs `workload-identity-directory/...`, not `runtime/...`, and a narrowed resource denies
+  identically to no grant at all.
+- **Region is constrained with `aws:RequestedRegion` instead**, which restricts scope
+  without guessing resource ARNs. **If anything ever denies unexpectedly, remove this
+  condition first** — it is the only speculative element in the document.
+
 #### The one statement to add alongside it
 
 ```json

@@ -177,15 +177,72 @@ Two entries are not resource-scoped, and they are the ones worth questioning:
 > permission checker cannot probe `CreateAgentRuntime` without creating a real runtime,
 > so the only test is a deploy attempt.
 
-### Recommended: the AWS-managed policy instead of the JSON above
+### ✅ RECOMMENDED ASK: the AWS-managed policy, **plus** the ECR statements above
 
-Attaching **`BedrockAgentCoreFullAccess`** ends the round trips in one step, because it
-covers whatever `CreateAgentRuntime` transitively authorizes. It is a named AWS policy
-rather than hand-written JSON, which is often a different (easier) approval path.
+Attach **`arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess`**. It is a named AWS policy
+rather than hand-written JSON, which is often an easier approval path, and it ends the
+round trips in one step because its first statement is:
 
-One caveat AWS raises itself: it includes `bedrock-agentcore:GetWorkloadAccessTokenForUserId`,
-which issues tokens from a caller-supplied user id with no IdP verification. Worth pairing
-the attachment with an explicit `Deny` on that single action.
+```json
+{
+  "Sid": "BedrockAgentCoreFullAccess",
+  "Effect": "Allow",
+  "Action": ["bedrock-agentcore:*"],
+  "Resource": "arn:aws:bedrock-agentcore:*:*:*"
+}
+```
+
+`bedrock-agentcore:*` covers `CreateAgentRuntimeEndpoint`, `CreateWorkloadIdentity`, and
+any further action `CreateAgentRuntime` transitively authorizes that nobody has hit yet.
+
+Verified against the published document (**version v18, edited 2026-07-28**) at
+<https://docs.aws.amazon.com/aws-managed-policy/latest/reference/BedrockAgentCoreFullAccess.html>
+— we cannot read it from this account because `iam:GetPolicy` is denied.
+
+Two of its statements matter to this project specifically:
+
+- **`iam:PassRole` is scoped to `arn:aws:iam::*:role/*BedrockAgentCore*`.** Our execution
+  role is `AmazonBedrockAgentCoreAEOGroundTruthBrowserRole`, which matches — this is the
+  concrete payoff of not "tidying" that name.
+- It grants **`iam:GetRole`**, the one action `check_permissions.py` still reports missing,
+  so `provision.py --check` would stop saying it cannot tell whether the role exists.
+
+#### 🔴 It must be ADDITIVE — it cannot replace the ECR grant
+
+Its only ECR statement is **read-only** (`ecr:DescribeRepositories`, `ecr:DescribeImages`,
+`ecr:ListImages`). There is no `PutImage`, no layer upload, and no
+`ecr:GetAuthorizationToken`. **Attached *instead of* the `OwnEcrNamespaceOnly` statement
+above, the image push breaks** and the deploy fails one step earlier than it does today.
+
+Likewise its Secrets Manager grant is scoped to `secret:bedrock-agentcore*`, which does
+**not** cover this feature's `brightdata-<town>-<region>` naming, so
+`ProxyCredentialSecretsForThisFeature` is still required.
+
+#### The one statement to add alongside it
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyUnverifiedWorkloadTokens",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+This is AWS's own recommendation in the policy's "Considerations" section: `bedrock-agentcore:*`
+pulls in `GetWorkloadAccessTokenForUserId`, which issues workload access tokens from a
+caller-supplied user identifier **with no IdP token verification**. AWS advises allowing
+only `GetWorkloadAccessTokenForJWT` in production and explicitly denying this one.
+
+It is safe for this runtime: the deny applies to the human caller's identity, whereas the
+runtime obtains its tokens through the service-linked role governed by
+`BedrockAgentCoreRuntimeIdentityServiceRolePolicy` — a different principal, unaffected by
+an identity-based deny on a user.
 
 ### Alternative: you run the whole thing once, we get nothing
 

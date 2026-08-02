@@ -461,9 +461,20 @@ def main() -> int:
         # because CreateAgentRuntime implicitly creates a DEFAULT endpoint. The lesson is
         # that the set of actions a single API call authorizes is not knowable from its
         # name, so this reports whatever AWS actually named rather than what we predicted.
+        #
+        # The THIRD run taught the other half: the RESOURCE is just as unpredictable as
+        # the action. It failed on `CreateWorkloadIdentity`, whose resource is not a
+        # runtime at all but
+        # `workload-identity-directory/default/workload-identity/*`, while this handler
+        # confidently printed `runtime/*`. That is the worst possible failure shape for a
+        # permission request: a statement granted on the wrong resource denies *byte for
+        # byte identically*, so the next run looks like the grant never landed and the
+        # blame lands on whoever administers the account. So parse the resource out of
+        # the message too, and only fall back to a guess when AWS did not name one.
         message = str(exc)
         match = re.search(r"not authorized to perform:\s*(\S+)", message)
         action = match.group(1) if match else "(see the message below)"
+        resource_match = re.search(r"on resource:\s*(\S+)", message)
         print()
         print("=" * 78)
         print(f"BLOCKED on {action} - everything before this step worked.")
@@ -474,11 +485,15 @@ def main() -> int:
         print()
         print("Ask for this statement, then re-run - nothing above has to be redone:")
         print("=" * 78)
-        resource = (
-            role_arn
-            if action.startswith("iam:")
-            else f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/*"
-        )
+        if resource_match:
+            # What AWS actually evaluated. Widen a concrete ARN to its sibling wildcard
+            # only where the message already ends in one; never narrow it.
+            resource = resource_match.group(1)
+        elif action.startswith("iam:"):
+            resource = role_arn
+        else:
+            resource = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/*"
+            print("# NOTE: AWS did not name a resource; this one is a GUESS.")
         statement: dict = {"Effect": "Allow", "Action": action, "Resource": resource}
         if action == "iam:PassRole":
             statement["Condition"] = {

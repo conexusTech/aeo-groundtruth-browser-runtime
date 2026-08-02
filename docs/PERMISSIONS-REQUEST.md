@@ -124,6 +124,12 @@ secrets. It grants nothing over the existing `aeoskills` runtimes or any other r
       "Resource": "*"
     },
     {
+      "Sid": "CreateTheRuntimesWorkloadIdentity",
+      "Effect": "Allow",
+      "Action": "bedrock-agentcore:CreateWorkloadIdentity",
+      "Resource": "arn:aws:bedrock-agentcore:us-east-1:082585646836:workload-identity-directory/default/workload-identity/*"
+    },
+    {
       "Sid": "ProxyCredentialSecretsForThisFeature",
       "Effect": "Allow",
       "Action": [
@@ -156,6 +162,30 @@ Two entries are not resource-scoped, and they are the ones worth questioning:
 > created, ARM64 image pushed, `iam:PassRole` accepted) and only this last call failed.
 > The other three are included because the same relationship applies on redeploy and on
 > invoking a specific qualifier, and discovering each one costs another round trip.
+
+> **`CreateWorkloadIdentity` was the THIRD action discovered this way**, on the deploy
+> attempt after the endpoint actions were granted. `CreateAgentRuntime` also provisions
+> the runtime's workload identity, and note the resource: **not a `runtime/*` ARN at all**
+> but `workload-identity-directory/default/workload-identity/*`. Our own tooling had
+> guessed `runtime/*` and would have sent you a statement that denies identically — so if
+> a grant ever appears to have "not taken effect", suspect the resource before suspecting
+> the grant.
+>
+> **This is why the managed-policy option below is now the recommendation.** Three
+> separate round trips have each ended with AWS naming an action nobody could have
+> enumerated in advance, and there is no way to know whether a fourth exists — the
+> permission checker cannot probe `CreateAgentRuntime` without creating a real runtime,
+> so the only test is a deploy attempt.
+
+### Recommended: the AWS-managed policy instead of the JSON above
+
+Attaching **`BedrockAgentCoreFullAccess`** ends the round trips in one step, because it
+covers whatever `CreateAgentRuntime` transitively authorizes. It is a named AWS policy
+rather than hand-written JSON, which is often a different (easier) approval path.
+
+One caveat AWS raises itself: it includes `bedrock-agentcore:GetWorkloadAccessTokenForUserId`,
+which issues tokens from a caller-supplied user id with no IdP verification. Worth pairing
+the attachment with an explicit `Deny` on that single action.
 
 ### Alternative: you run the whole thing once, we get nothing
 

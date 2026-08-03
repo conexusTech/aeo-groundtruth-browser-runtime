@@ -67,13 +67,24 @@ async def invocations(request: Request) -> InvocationResponse:
         return InvocationResponse(error=f"invalid payload: {exc}")
 
     logger.info(
-        "invocation surface=%s url=%s proxied=%s target=%s",
+        "invocation surface=%s url=%s proxied=%s target=%s discover=%s",
         parsed.surface,
         parsed.url,
         parsed.proxy is not None,
         parsed.proxy_target,
+        parsed.discover,
     )
-    return await run_invocation(parsed, region=AGENTCORE_REGION)
+    try:
+        return await run_invocation(parsed, region=AGENTCORE_REGION)
+    except Exception as exc:  # noqa: BLE001
+        # Last resort, and it has already earned its place once: `client.start` used to
+        # sit outside `run_invocation`'s try, so the likeliest production failure (an
+        # execution role without `StartBrowserSession`) escaped as a 500. That is fixed
+        # at the source, but the "always 200 with an envelope" invariant is the whole
+        # contract with the consumer's retry predicate, and it should not depend on every
+        # future edit to `driver` getting its exception handling right.
+        logger.exception("run_invocation escaped without an envelope")
+        return InvocationResponse(error=f"unhandled {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

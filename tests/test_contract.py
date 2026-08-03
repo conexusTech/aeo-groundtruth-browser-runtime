@@ -123,6 +123,32 @@ def test_a_bad_payload_answers_200_with_an_error_not_a_500():
     assert body["error"]
 
 
+def test_an_exception_escaping_the_driver_is_still_a_200_envelope(monkeypatch):
+    """The invariant, guarded at the HTTP layer rather than trusted.
+
+    It was broken in practice: `client.start` sat outside `run_invocation`'s try, so an
+    execution role missing `StartBrowserSession` - the likeliest production failure, and
+    one that deploys cleanly and passes /ping - escaped as a 500. The consumer would have
+    received an opaque boto3 error whose retry predicate cannot tell a login wall from a
+    crash. Fixed at the source; this stops any future edit from reintroducing it.
+    """
+    from app import main
+
+    async def explode(req, region):
+        raise RuntimeError("AccessDeniedException: StartBrowserSession")
+
+    monkeypatch.setattr(main, "run_invocation", explode)
+    response = TestClient(app).post("/invocations", json=FLAT_PAYLOAD)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "StartBrowserSession" in body["error"]
+    assert body["answer_text"] == ""
+    # And it must still be a parseable envelope, not just any 200.
+    assert body["observed_egress"] is None
+    assert body["login_wall"] is False
+
+
 def test_ping_does_not_touch_aws():
     """AgentCore polls /ping to decide whether the runtime is in service. If it
     verified credentials or the browser service, a transient AWS blip would take the

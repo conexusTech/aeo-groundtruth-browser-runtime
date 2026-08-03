@@ -67,6 +67,11 @@ class InvocationRequest(BaseModel):
     #: targeting — targeting is entirely inside the secret's username. The consumer
     #: compares this against `observed_egress` and fails the job on a mismatch.
     proxy_target: str | None = None
+    #: Dump what each selector class really matches, and do not mutate the page.
+    #: Operator-only: aeo-agent-service never sets it. Discovery runs deliberately broad
+    #: selectors, so a production run with this on would report a page inventory instead
+    #: of measuring anything — and would skip the consent click that real runs need.
+    discover: bool = False
     #: Overall budget. Default sits under the consumer's
     #: AGENTCORE_SESSION_TIMEOUT_SECONDS=180 so we return a usable envelope instead of
     #: being abandoned mid-session: an abandoned invocation tells the operator nothing
@@ -115,5 +120,11 @@ class InvocationResponse(BaseModel):
     error: str | None = None
     #: How the prompt actually got typed and submitted, and how completion was
     #: detected. Written for the live selector pass: when an answer comes back empty,
-    #: this says which step silently no-opped.
+    #: this says which step silently no-opped. Carries `step`, the phase that was in
+    #: progress, so a failure envelope names its own location.
     trace: dict[str, Any] = Field(default_factory=dict)
+    #: Only populated when the request asked to `discover`. A per-selector-class
+    #: inventory of what actually matched and which of those were visible — the pairing
+    #: that distinguishes "the selector is wrong" from "the selector points at a node
+    #: that is never visible", which a Playwright timeout does not.
+    discovery: dict[str, Any] | None = None

@@ -62,6 +62,7 @@ hand-off, no ticket. Verified by attempting each call, not inferred:
 | Capability | Status |
 |---|---|
 | `bedrock-agentcore:*` — create/update/delete/invoke runtimes, browser sessions | ✅ **in `us-east-1` only** (the policy carries an `aws:RequestedRegion` condition) |
+| `bedrock:*` / `bedrock-runtime:*` — foundation-model invocation | ✅ but from **a different, pre-existing policy** — see the note below |
 | ECR create/push/pull | ✅ but scoped to `repository/aeo-groundtruth/*` |
 | Secrets Manager create/read | ✅ but scoped to `secret:brightdata-*` |
 | IAM **read** (`GetRole`, `ListRoles`, `ListRolePolicies`, `GetRolePolicy`) | ✅ |
@@ -79,6 +80,18 @@ So the three things that make a *new* AgentCore feature need an administrator:
 3. **A different ECR namespace or secret prefix.** Both grants are scoped. Keeping new
    images under `aeo-groundtruth/*` and new secrets under `brightdata-*` avoids a grant;
    anything else needs the resource ARN widened.
+
+> ⚠️ **`bedrock-agentcore` and `bedrock` are different services.** `policy-caller.json` grants
+> the first and never mentions the second. Foundation-model access exists anyway, from some
+> other pre-existing policy — `bedrock:ListFoundationModels` returns 119 models and an
+> invocation of `us.anthropic.claude-sonnet-5` succeeds. Two traps in there: use the
+> **`us.` inference-profile prefix**, not the bare model id; and
+> `anthropic.claude-3-5-haiku-20241022-v1:0` is **EOL**, returning `ResourceNotFoundException`,
+> which reads like a permissions or typo problem and is neither.
+>
+> **Caller access is not runtime access.** This runtime's execution role deliberately has no
+> `bedrock:InvokeModel` — it drives a page and calls no model. A *new* AgentCore runtime that
+> needs one requires the role updated, which is an administrator action.
 
 > The *runtime's* execution role (step 3) is a different thing from the *caller's*
 > permissions. Confusing the two is the most common way this gets stuck: the caller needs

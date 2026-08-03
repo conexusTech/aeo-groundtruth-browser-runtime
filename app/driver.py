@@ -321,7 +321,13 @@ async def _read_field_text(field: Locator) -> str:
 
 
 async def _enter_prompt(
-    page: Page, sel: Selectors, prompt: str, deadline: _Deadline, trace: dict
+    page: Page,
+    sel: Selectors,
+    prompt: str,
+    deadline: _Deadline,
+    trace: dict,
+    *,
+    discover: bool = False,
 ) -> None:
     """Type the prompt and submit it.
 
@@ -367,7 +373,15 @@ async def _enter_prompt(
         trace["input_readback"] = "ok"
 
     submitted = False
-    if sel.submit:
+    if discover:
+        # Same hazard as the consent click, and the same answer. Discovery's submit
+        # selector is deliberately broad (`button[data-testid], button[aria-label]`), and
+        # its first visible match on the live chatgpt.com page is "Open sidebar" — which
+        # would be clicked, marked as submitted, and the prompt never sent. Enter works on
+        # both surfaces, so discovery always uses it and the submit candidates are read
+        # from the dump instead of by clicking one.
+        trace["submit_forced_to_enter_for_discovery"] = sel.submit
+    elif sel.submit:
         try:
             button = page.locator(sel.submit).filter(visible=True).first
             if await button.is_enabled(timeout=5_000):
@@ -646,7 +660,7 @@ async def _drive(
     # question", and the only honest test for that is to try to ask it.
     state.step("enter_prompt")
     try:
-        await _enter_prompt(page, sel, req.prompt, deadline, trace)
+        await _enter_prompt(page, sel, req.prompt, deadline, trace, discover=req.discover)
     except DeadlineExceeded:
         raise
     except Exception as exc:  # noqa: BLE001

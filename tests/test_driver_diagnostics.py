@@ -756,6 +756,44 @@ def test_discovery_never_clicks_anything(monkeypatch):
     assert "consent_dismissed" not in result.trace
 
 
+def test_discovery_submits_with_enter_rather_than_clicking_a_broad_match(monkeypatch):
+    """Discovery's submit selector is deliberately broad, and its first visible match on
+    the live chatgpt.com page is "Open sidebar". Clicking it marks the prompt submitted and
+    sends nothing - so the run would wait out its budget for an answer to a question it
+    never asked."""
+    send = FakeNode(visible=True, text="Open sidebar")
+    page = FakePage(
+        {
+            "#send": [send],
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [_TransientNode()],
+            "#answer": [FakeNode(text="An answer.")],
+        }
+    )
+    result = _run(_request({}, discover=True), page, monkeypatch)
+
+    assert send.clicked is False
+    assert result.trace["submit_method"] == "enter"
+    assert result.trace["submit_forced_to_enter_for_discovery"] == "#send"
+
+
+def test_a_normal_run_still_clicks_its_submit_button(monkeypatch):
+    """Scoped to discovery only: a real run has a precise selector and should use it."""
+    send = FakeNode(visible=True)
+    page = FakePage(
+        {
+            "#send": [send],
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [_TransientNode()],
+            "#answer": [FakeNode(text="An answer.")],
+        }
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert send.clicked is True
+    assert result.trace["submit_method"] == "button"
+
+
 def test_a_normal_run_still_dismisses_consent_and_dumps_nothing(monkeypatch):
     """On a residential exit these walls are the norm, so the skip must be scoped to
     discovery only."""

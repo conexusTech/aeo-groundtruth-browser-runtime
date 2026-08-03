@@ -79,6 +79,11 @@ _STREAM_APPEAR_TIMEOUT_MS = 15_000
 #: `domcontentloaded` is not going to, and the remaining budget is better spent
 #: reporting that than waiting on it.
 _INPUT_TIMEOUT_MS = 30_000
+#: Ceiling on the text-stability fallback specifically, separate from the invocation
+#: deadline. The deadline is the whole budget; spending all of it on the weakest completion
+#: signal is what a live run did (164s, no answer). An answer that has not settled in 90s
+#: is not going to.
+_STABILITY_MAX_MS = 90_000
 #: Per selector class in a discovery dump. Enough to see the shape of the page without
 #: turning `a[href^='http']` into a megabyte of envelope.
 _DISCOVERY_SAMPLE_LIMIT = 25
@@ -462,18 +467,35 @@ async def _await_completion(
             return
         except DeadlineExceeded:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_page_gone(exc):
+                # Not a missing indicator — the document is gone, and the fallback below
+                # would poll a corpse for the rest of the budget.
+                raise PageGone(str(exc)) from exc
             trace["stream_appeared"] = trace.get("stream_appeared", False)
 
     # Stability fallback: the answer is done when its length stops changing.
+    #
+    # Bounded by `_STABILITY_MAX_MS` as well as by the deadline. Letting it run to the
+    # full budget is what a live perplexity.ai run did: 164 seconds of paid session
+    # polling every 1.5s for an answer that never stabilised, then returning nothing. The
+    # deadline is the invocation's whole budget, so using it as this loop's only bound
+    # spends everything on the weakest signal we have — and if the answer has not settled
+    # in 90s it is not going to.
     trace["completion"] = "text_stabilized"
+    started = time.monotonic()
     previous = -1
     stable_rounds = 0
     while stable_rounds < 3:
         if deadline.expired:
             trace["completion"] = "text_still_growing_at_deadline"
             return
+        if (time.monotonic() - started) * 1000 >= _STABILITY_MAX_MS:
+            trace["completion"] = "text_never_stabilized"
+            return
         await asyncio.sleep(1.5)
+        # PageGone propagates deliberately: no further polling can help, and `_drive`
+        # turns it into an envelope that says so.
         current = len(await _read_answer(page, sel))
         if current == previous and current > 0:
             stable_rounds += 1
@@ -565,6 +587,33 @@ async def _discover(page: Page, sel: Selectors, phase: str) -> dict[str, Any]:
     return out
 
 
+class PageGone(Exception):
+    """The page, context or browser closed under us. No further waiting can help.
+
+    Distinguished from "no answer yet" because the stability fallback cannot tell them
+    apart on its own, and getting that wrong is expensive: `_read_answer` swallowed the
+    error and returned "", so `current > 0` was never true, `stable_rounds` never
+    incremented, and the loop polled a dead page every 1.5s for the WHOLE remaining
+    budget. Observed live on 2026-08-03 — ~110s of paid session spent re-reading a
+    browser that had already gone away, logging the same warning 70+ times.
+    """
+
+
+#: Playwright's wording when the target is gone. Matched on the message because Playwright
+#: raises a plain `Error` for this, not a distinct exception class.
+_PAGE_GONE_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "target closed",
+    "websocket",
+)
+
+
+def _is_page_gone(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _PAGE_GONE_MARKERS)
+
+
 async def _read_answer(page: Page, sel: Selectors) -> str:
     """Read the answer text.
 
@@ -580,6 +629,10 @@ async def _read_answer(page: Page, sel: Selectors) -> str:
             return ""
         return (await nodes.nth(count - 1).inner_text()).strip()
     except Exception as exc:  # noqa: BLE001
+        if _is_page_gone(exc):
+            # Raised, not swallowed. Returning "" here is what let the stability loop
+            # mistake a dead browser for a slow answer and poll it to the deadline.
+            raise PageGone(str(exc)) from exc
         logger.warning("reading the answer failed: %s", exc)
         return ""
 
@@ -832,6 +885,22 @@ async def run_invocation(req: InvocationRequest, region: str) -> InvocationRespo
                 return await _drive(page, req, deadline, state)
             finally:
                 await browser.close()
+    except PageGone as exc:
+        # Its own arm so it does not read as a mystery crash. A closed page is usually
+        # someone else closing it — AgentCore reaping the session, the client
+        # disconnecting, a concurrent invocation's teardown — so the consumer should treat
+        # it as retryable infrastructure rather than as a page-state verdict about the
+        # surface.
+        logger.warning(
+            "the page closed under us at step=%s: %s", state.trace.get("step"), exc
+        )
+        state.trace["page_gone"] = True
+        return InvocationResponse(
+            error=f"PageGone: {exc}",
+            observed_egress=state.egress,
+            trace=state.trace,
+            discovery=state.discovery,
+        )
     except DeadlineExceeded as exc:
         logger.error("invocation exceeded its budget: %s (step=%s)", exc, state.trace.get("step"))
         return InvocationResponse(
@@ -867,13 +936,26 @@ async def run_invocation(req: InvocationRequest, region: str) -> InvocationRespo
                 await asyncio.to_thread(client.stop)
                 logger.info("browser session %s stopped", session_id)
             except Exception as exc:  # noqa: BLE001
-                # Logged loudly rather than raised: raising here would replace the real
-                # result with a teardown error, but a leak is money, so it must be
-                # greppable. `_SESSION_TIMEOUT_SECONDS` is the backstop.
-                logger.error(
-                    "FAILED TO STOP browser session %s - it will run until the %ss "
-                    "session timeout expires: %s",
-                    session_id,
-                    _SESSION_TIMEOUT_SECONDS,
-                    exc,
-                )
+                if "already terminated" in str(exc).lower():
+                    # NOT a leak, and it must not claim to be one. AgentCore answers
+                    # ConflictException when the session is already gone — it reaps them on
+                    # client disconnect — and the old wording announced a paid browser
+                    # running for 300s when in fact nothing was running. A false money-leak
+                    # alarm is worse than silence: it sends the next person hunting a cost
+                    # that does not exist, and it appeared 1x per retried invocation during
+                    # the 2026-08-03 retry storm.
+                    logger.info(
+                        "browser session %s was already terminated; nothing leaked",
+                        session_id,
+                    )
+                else:
+                    # Logged loudly rather than raised: raising here would replace the real
+                    # result with a teardown error, but a leak is money, so it must be
+                    # greppable. `_SESSION_TIMEOUT_SECONDS` is the backstop.
+                    logger.error(
+                        "FAILED TO STOP browser session %s - it will run until the %ss "
+                        "session timeout expires: %s",
+                        session_id,
+                        _SESSION_TIMEOUT_SECONDS,
+                        exc,
+                    )

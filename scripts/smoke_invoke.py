@@ -33,6 +33,7 @@ import sys
 import uuid
 
 import boto3
+from botocore.config import Config as BotoConfig
 
 REGION = "us-east-1"
 
@@ -133,7 +134,22 @@ def main() -> int:
             "mismatch. That is correct behaviour, not a failure.\n"
         )
 
-    client = boto3.client("bedrock-agentcore", region_name=REGION)
+    # Explicit timeout, and retries OFF. botocore defaults to a 60s read timeout with
+    # retries enabled, while the runtime's own deadline is 165s — so the default config
+    # gives up mid-invocation and retries, and **each retry opens another paid browser
+    # session while the previous one is still driving the page.** The first perplexity.ai
+    # run produced FIVE sessions at exactly 60s intervals before the script died, two of
+    # them still billing afterwards. The traceback blames a read timeout and says nothing
+    # about the four extra browsers.
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name=REGION,
+        config=BotoConfig(
+            read_timeout=240,
+            connect_timeout=15,
+            retries={"total_max_attempts": 1},
+        ),
+    )
     response = client.invoke_agent_runtime(
         agentRuntimeArn=args.arn,
         # Must be 33+ characters, which is why two hex UUIDs are concatenated. A short

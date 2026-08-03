@@ -703,6 +703,80 @@ def test_a_fill_that_sticks_is_not_retyped(monkeypatch):
     assert not page.keyboard.typed
 
 
+# --- a closed page is terminal, not "no answer yet" -------------------------------
+
+
+class _ClosedLocator(FakeLocator):
+    """Playwright's behaviour once the target is gone: every call raises."""
+
+    async def count(self):
+        raise FakeTimeout("Locator.count: Target page, context or browser has been closed")
+
+
+def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatch):
+    """The live cost bug. `_read_answer` swallowed the closed-page error and returned "",
+    so `current > 0` was never true, `stable_rounds` never incremented, and the stability
+    loop polled a dead browser every 1.5s for the WHOLE remaining budget - about 110s of
+    paid session, logging the same warning 70+ times."""
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [_TransientNode()],
+        }
+    )
+    original = page.locator
+    page.locator = lambda s: _ClosedLocator([]) if s == "#answer" else original(s)
+
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.trace.get("page_gone") is True
+    assert "PageGone" in (result.error or "")
+    # Not misfiled as a page-state verdict about the surface: a closed page is usually
+    # someone else closing it, so the consumer must be free to retry.
+    assert result.login_wall is False
+    assert result.challenge is False
+
+
+def test_the_stability_fallback_is_bounded_independently_of_the_deadline(monkeypatch):
+    """A live perplexity.ai run spent 164 seconds - its entire budget - polling for an
+    answer that never stabilised, then returned nothing. The deadline is the whole
+    invocation's budget, so using it as this loop's only bound spends everything on the
+    weakest completion signal we have.
+
+    The cap is shrunk rather than the deadline raised. With a real 90s cap this test would
+    either spin for 90 seconds of monotonic time (sleep is a no-op here) or hit the
+    fixture's deadline first and prove nothing — which is exactly what the first version
+    did, reporting `text_still_growing_at_deadline` and passing for the wrong reason.
+    """
+    monkeypatch.setattr(driver, "_STABILITY_MAX_MS", 50)
+    reads = {"n": 0}
+
+    class GrowingLocator(FakeLocator):
+        async def inner_text(self, timeout=None):
+            reads["n"] += 1
+            return "x" * reads["n"]  # never the same length twice
+
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode(visible=False)],
+            "#answer": [FakeNode(text="grows")],
+        }
+    )
+    original = page.locator
+    page.locator = lambda s: (
+        GrowingLocator([FakeNode(text="grows")]) if s == "#answer" else original(s)
+    )
+
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.trace["completion"] == "text_never_stabilized", (
+        "an answer that never settles ran to the deadline instead of a bounded cap"
+    )
+    # Bounded by the stability cap, NOT by the invocation deadline.
+    assert result.trace["step"] == "done"
+
+
 # --- the session can be bounced off the surface entirely --------------------------
 
 

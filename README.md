@@ -125,12 +125,20 @@ python scripts/smoke_invoke.py --arn <arn> --discover
 new image and updates the runtime to that digest. Deploys go by **digest, not tag**, so
 the image a quarterly job runs cannot silently be whatever was pushed last.
 
-**Deploying currently requires access this project does not have** — see
-[`docs/PERMISSIONS-REQUEST.md`](docs/PERMISSIONS-REQUEST.md). `ecr:CreateRepository`,
-`ecr:InitiateLayerUpload` and `iam:CreateRole` are all denied for the developer account,
-so either an administrator runs `provision.py` once, or the scoped policy in that
-document is granted. The script degrades on purpose: it reports every blocker in one run
-and leaves nothing half-created.
+**✅ Deployed since 2026-08-03** at
+`arn:aws:bedrock-agentcore:us-east-1:082585646836:runtime/aeo_groundtruth_browser-fGhiSo82t0`
+(currently v4, `READY`). The permissions in
+[`docs/policy-caller.json`](docs/policy-caller.json) were applied and the whole run
+succeeded first try;
+[`docs/PERMISSIONS-REQUEST.md`](docs/PERMISSIONS-REQUEST.md) explains each statement for
+whoever approves it.
+
+**To do any of this by hand — or to hand it to an administrator — see
+[`docs/RUNBOOK-agentcore-runtime.md`](docs/RUNBOOK-agentcore-runtime.md).** Every AWS CLI
+command in it was run for real, and its *"eight things that will bite you"* section covers
+what is not inferable from AWS's documentation: `CreateAgentRuntime` silently authorizes
+**three** actions whose resources are not all `runtime/*`, `--provenance=false` is
+mandatory, and there is no way to pre-test the create call at all.
 
 Target account/region is `082585646836` / `us-east-1`, matching the existing
 `AgentCore-aeoskills-production` stack. Those two runtimes are the proven pattern this

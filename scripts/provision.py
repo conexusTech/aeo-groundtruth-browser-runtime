@@ -386,6 +386,14 @@ def ensure_runtime(container_uri: str, role_arn: str, check: bool) -> str | None
         "idleRuntimeSessionTimeout": 300,
         "maxLifetime": 3600,
     }
+    #: Passed on BOTH create and update. `update_agent_runtime` is a full replace, not a
+    #: merge — omitting this on the update path wiped the variables the create had set,
+    #: which `get-agent-runtime` then reports as `environmentVariables: null`. It went
+    #: unnoticed because both values happen to equal the defaults baked into `main.py`
+    #: (`AGENTCORE_REGION` falls back to us-east-1, `LOG_LEVEL` to INFO), so nothing broke
+    #: — it would have broken the first time a non-default value mattered, three redeploys
+    #: after the one that set it.
+    environment = {"AGENTCORE_REGION": REGION, "LOG_LEVEL": "INFO"}
     if existing:
         response = control.update_agent_runtime(
             agentRuntimeId=existing["agentRuntimeId"],
@@ -393,6 +401,7 @@ def ensure_runtime(container_uri: str, role_arn: str, check: bool) -> str | None
             networkConfiguration={"networkMode": "PUBLIC"},
             roleArn=role_arn,
             lifecycleConfiguration=lifecycle,
+            environmentVariables=environment,
         )
         print(f"[runtime] updated to version {response.get('agentRuntimeVersion')}")
         return existing["agentRuntimeArn"]
@@ -404,7 +413,7 @@ def ensure_runtime(container_uri: str, role_arn: str, check: bool) -> str | None
         networkConfiguration={"networkMode": "PUBLIC"},
         roleArn=role_arn,
         lifecycleConfiguration=lifecycle,
-        environmentVariables={"AGENTCORE_REGION": REGION, "LOG_LEVEL": "INFO"},
+        environmentVariables=environment,
     )
     print(f"[runtime] created: {response['agentRuntimeArn']} ({response['status']})")
     return response["agentRuntimeArn"]

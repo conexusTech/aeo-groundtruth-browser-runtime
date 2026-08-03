@@ -54,6 +54,32 @@ The caller needs the permissions in `docs/policy-caller.json` — one self-conta
 whole run succeeded first try. `docs/PERMISSIONS-REQUEST.md` explains each statement for
 whoever approves it.
 
+### What is self-serve today, and what still needs an administrator
+
+`leo.lindo` holds `policy-caller.json`, so **AgentCore work is ours to do directly** — no
+hand-off, no ticket. Verified by attempting each call, not inferred:
+
+| Capability | Status |
+|---|---|
+| `bedrock-agentcore:*` — create/update/delete/invoke runtimes, browser sessions | ✅ **in `us-east-1` only** (the policy carries an `aws:RequestedRegion` condition) |
+| ECR create/push/pull | ✅ but scoped to `repository/aeo-groundtruth/*` |
+| Secrets Manager create/read | ✅ but scoped to `secret:brightdata-*` |
+| IAM **read** (`GetRole`, `ListRoles`, `ListRolePolicies`, `GetRolePolicy`) | ✅ |
+| `iam:PassRole` | ✅ but only for `AmazonBedrockAgentCoreAEOGroundTruthBrowserRole` |
+| **`iam:CreateRole` / `PutRolePolicy` / `DeleteRole`** | 🛑 **denied** |
+
+So the three things that make a *new* AgentCore feature need an administrator:
+
+1. **A new execution role.** Reuse `AmazonBedrockAgentCoreAEOGroundTruthBrowserRole` where
+   its permissions fit, and the whole feature stays self-serve. A genuinely different one
+   (different secrets, a model invocation, a new AWS service) needs the role created for us
+   — send the two policy documents, as in step 4.
+2. **A different region.** The `aws:RequestedRegion: us-east-1` condition denies everything
+   else. Put new AgentCore work in `us-east-1` unless there is a reason not to.
+3. **A different ECR namespace or secret prefix.** Both grants are scoped. Keeping new
+   images under `aeo-groundtruth/*` and new secrets under `brightdata-*` avoids a grant;
+   anything else needs the resource ARN widened.
+
 > The *runtime's* execution role (step 3) is a different thing from the *caller's*
 > permissions. Confusing the two is the most common way this gets stuck: the caller needs
 > to create and pass the role; the role needs to drive browser sessions and read secrets.
@@ -331,12 +357,34 @@ silently succeeds, which is the worse failure.)
 **5. `runtimeSessionId` must be 33+ characters.** A short id is **rejected by the API**, not
 silently padded. `smoke_invoke.py` concatenates two hex UUIDs for 64.
 
-**6. `iam:GetRole` being denied is not evidence the role is absent.** It means you cannot
-*see* it. If an admin already created the role, pass `--role-arn` — otherwise the create
-attempt fails with `EntityAlreadyExists`, which reads like a different problem. Corollary:
-you cannot verify the execution role's *policy contents* either, so a role missing
-`StartBrowserSession` deploys cleanly, passes `/ping`, and fails only at invocation — which
-presents as your bug. (Verified fine here: three live sessions.)
+**6. IAM is where the remaining wall is, and it moved — check before assuming.** As of the
+`policy-caller.json` grant we **can** read IAM (`iam:GetRole`, `ListRoles`,
+`ListRolePolicies`, `GetRolePolicy`) but **cannot** create it (`iam:CreateRole` and
+`iam:PutRolePolicy` are denied — verified by attempting `CreateRole`, which failed and left
+nothing behind).
+
+So the execution role's policy contents **are** now verifiable, and were verified: the live
+inline policy matches `provision.py`'s `PERMISSION_POLICY` Sid for Sid. That retires a
+long-standing caveat — a role missing `StartBrowserSession` used to be an untestable risk
+that would deploy cleanly, pass `/ping`, and fail only at invocation, presenting as your
+bug. Read it instead:
+
+```powershell
+aws iam list-role-policies --role-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRole
+aws iam get-role-policy --role-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRole `
+  --policy-name AEOGroundTruthBrowserRuntimePolicy `
+  --query 'PolicyDocument.Statement[].Sid'
+```
+
+Older notes in this repo and in the project memory say `iam:GetRole` is denied. **That is
+stale.** What is still true: a *new* AgentCore feature needing a *new* execution role needs
+an administrator, or must reuse this one.
+
+⚠️ **The admin named the inline policy `AEOGroundTruthBrowserRuntimePolicy`**, while
+`provision.py`'s create path would name it
+`AmazonBedrockAgentCoreAEOGroundTruthBrowserRolePolicy`. Harmless today (that path never
+ran) but it means the role would end up with *two* inline policies if it were ever
+recreated by the script — and the teardown command below has to use the real name.
 
 **7. The `{"input": {...}}` payload wrapper is AWS's example convention, not the
 platform's.** AgentCore passes the payload bytes through verbatim. A flat payload is
@@ -358,9 +406,14 @@ pins it.
 aws bedrock-agentcore-control delete-agent-runtime `
   --agent-runtime-id aeo_groundtruth_browser-fGhiSo82t0 --region us-east-1
 
+# The live policy name is AEOGroundTruthBrowserRuntimePolicy - what the admin chose, NOT
+# what provision.py would have named it. List them first rather than guessing.
+aws iam list-role-policies --role-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRole
 aws iam delete-role-policy --role-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRole `
-  --policy-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRolePolicy
+  --policy-name AEOGroundTruthBrowserRuntimePolicy
 aws iam delete-role --role-name AmazonBedrockAgentCoreAEOGroundTruthBrowserRole
+# ^ both IAM deletes need an administrator: iam:CreateRole/PutRolePolicy/DeleteRole are
+#   NOT granted to leo.lindo. Everything else here is self-serve.
 
 aws ecr delete-repository --repository-name aeo-groundtruth/browser `
   --region us-east-1 --force

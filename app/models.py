@@ -72,11 +72,25 @@ class InvocationRequest(BaseModel):
     #: selectors, so a production run with this on would report a page inventory instead
     #: of measuring anything — and would skip the consent click that real runs need.
     discover: bool = False
-    #: Overall budget. Default sits under the consumer's
-    #: AGENTCORE_SESSION_TIMEOUT_SECONDS=180 so we return a usable envelope instead of
-    #: being abandoned mid-session: an abandoned invocation tells the operator nothing
-    #: about WHY, and on this path every attempt is already paid for.
-    timeout_seconds: float = 165.0
+    #: Overall budget, and it must sit under BOTH the consumer's
+    #: AGENTCORE_SESSION_TIMEOUT_SECONDS and AgentCore's own synchronous-invocation
+    #: ceiling. An abandoned invocation tells the operator nothing about WHY, and on this
+    #: path every attempt is already paid for.
+    #:
+    #: **Lowered from 165 on 2026-08-03 because 165 does not come back.** Measured twice: a
+    #: run with this at 165 completed server-side in 164s, logged cleanly, stopped its
+    #: browser session — and the client received NOTHING, 74 seconds before its own 240s
+    #: read timeout expired. The same invocation with 75 returned an envelope in 83s. So
+    #: `InvokeAgentRuntime` drops a long *synchronous* response somewhere between 83s and
+    #: 164s.
+    #:
+    #: The exact ceiling is UNMEASURED: `servicequotas:ListServiceQuotas` and
+    #: `ce:GetCostAndUsage` are both denied to this account, and AWS's quota page could not
+    #: be read. 90 is chosen inside the proven-good range rather than just below a guessed
+    #: quota. If a real proxied run needs longer than this, the answer is **async
+    #: invocation with /ping polling**, not a bigger number here — that is the pattern the
+    #: earlier AgentCore scan work landed on for exactly this reason.
+    timeout_seconds: float = 90.0
 
 
 class Citation(BaseModel):

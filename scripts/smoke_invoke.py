@@ -103,6 +103,16 @@ def main() -> int:
         action="store_true",
         help="use broad selectors to find what is on the page, rather than our guesses",
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        help=(
+            "override the runtime's own budget (default 165). Lower it to test whether a "
+            "long SYNCHRONOUS invocation is being capped server-side: a 164s run once "
+            "completed and stopped its session cleanly, yet the client received nothing "
+            "74s before its own 240s read timeout expired."
+        ),
+    )
     parser.add_argument("--proxy-server")
     parser.add_argument("--proxy-port", type=int, default=22225)
     parser.add_argument("--proxy-secret", help="Secrets Manager ARN")
@@ -120,6 +130,8 @@ def main() -> int:
         # inventory of what matched, independently of whether the drive succeeds.
         "discover": args.discover,
     }
+    if args.timeout_seconds is not None:
+        payload["timeout_seconds"] = args.timeout_seconds
     if args.proxy_server:
         payload["proxy"] = {
             "server": args.proxy_server,

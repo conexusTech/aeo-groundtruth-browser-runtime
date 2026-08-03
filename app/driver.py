@@ -72,7 +72,10 @@ _EGRESS_PROVIDERS: tuple[tuple[str, str, tuple[str, str, str]], ...] = (
 _SESSION_TIMEOUT_SECONDS = 300
 
 _NAV_TIMEOUT_MS = 45_000
-_EGRESS_TIMEOUT_MS = 20_000
+#: Halved from 20s once the whole budget came down to 90s: two providers at 20s each was
+#: 40s of a 90s budget spent before the surface is even loaded. A geo-IP lookup that has
+#: not answered in 10s is failing, not slow.
+_EGRESS_TIMEOUT_MS = 10_000
 _CONSENT_TIMEOUT_MS = 3_000
 _STREAM_APPEAR_TIMEOUT_MS = 15_000
 #: Deliberately shorter than navigation: a composer that has not mounted 30s after
@@ -81,9 +84,10 @@ _STREAM_APPEAR_TIMEOUT_MS = 15_000
 _INPUT_TIMEOUT_MS = 30_000
 #: Ceiling on the text-stability fallback specifically, separate from the invocation
 #: deadline. The deadline is the whole budget; spending all of it on the weakest completion
-#: signal is what a live run did (164s, no answer). An answer that has not settled in 90s
-#: is not going to.
-_STABILITY_MAX_MS = 90_000
+#: signal is what a live run did (164s, no answer). An answer that has not settled in 45s
+#: is not going to — and this must stay comfortably under `timeout_seconds` (90s) or the
+#: deadline fires first and the cap never has an effect.
+_STABILITY_MAX_MS = 45_000
 #: Per selector class in a discovery dump. Enough to see the shape of the page without
 #: turning `a[href^='http']` into a megabyte of envelope.
 _DISCOVERY_SAMPLE_LIMIT = 25

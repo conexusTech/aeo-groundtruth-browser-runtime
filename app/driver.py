@@ -83,6 +83,27 @@ _INPUT_TIMEOUT_MS = 30_000
 #: turning `a[href^='http']` into a megabyte of envelope.
 _DISCOVERY_SAMPLE_LIMIT = 25
 
+#: Page-level signals that the session was bounced somewhere it cannot be measured.
+#:
+#: These are NOT selectors, and that is the point — the ones that matter carry no markup we
+#: could target. A live run ended on `chatgpt.com/api/auth/error` titled "Just a moment...",
+#: Cloudflare's interstitial, where every one of our eight selector classes matched zero
+#: elements. So the page state was invisible to a selector-only check and the run reported
+#: "no answer text matched the answer selector" — i.e. `extraction_failed`, which the
+#: consumer RETRIES, buying another paid session against the same wall.
+#:
+#: Deliberately a small heuristic list rather than a cross-repo contract addition: it only
+#: chooses between two already-terminal classifications and sharpens the error message. The
+#: load-bearing part needs no vendor strings at all — no answer plus a recorded final URL
+#: and title is reported as a page-state failure either way.
+_BLOCKED_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verifying you are human",
+    "checking your browser",
+)
+_AUTH_PATH_MARKERS = ("/auth/error", "/auth/login", "/api/auth", "/login")
+
 
 class DeadlineExceeded(Exception):
     """Our own budget ran out. Distinct from a Playwright timeout on one step."""
@@ -430,7 +451,14 @@ async def _await_completion(
             await streaming.wait_for(
                 state="hidden", timeout=deadline.remaining_ms(120_000)
             )
+            # A navigation also satisfies "hidden" — the element is gone because the whole
+            # document is. A live run recorded `completion=streaming_selector_hidden`
+            # while the session was being bounced to an auth-error page, so the strongest
+            # completion signal we have was reporting a finished answer for a destroyed
+            # page. Recording the URL at this moment is what distinguishes the two, and
+            # the caller compares it against where the prompt was submitted from.
             trace["completion"] = "streaming_selector_hidden"
+            trace["url_at_completion"] = (await _page_state(page))[0]
             return
         except DeadlineExceeded:
             raise
@@ -576,6 +604,36 @@ async def _read_citations(page: Page, sel: Selectors) -> list[Citation]:
     return list(found.values())
 
 
+async def _page_state(page: Page) -> tuple[str, str]:
+    """The URL and title, always recorded. A future failure has to be diagnosable without
+    spending another paid session, and these two lines are what made this one legible."""
+    try:
+        title = await page.title()
+    except Exception:  # noqa: BLE001
+        title = ""
+    try:
+        url = page.url
+    except Exception:  # noqa: BLE001
+        url = ""
+    return url, title
+
+
+def _classify_blocked_page(url: str, title: str) -> str | None:
+    """"challenge" | "login" | None, from the URL and title alone.
+
+    Both outcomes are terminal for the consumer, so a mix-up between them costs only
+    diagnostic precision. What matters is that either is terminal, where the empty answer
+    this replaces was retryable.
+    """
+    lowered = title.strip().lower()
+    if any(marker in lowered for marker in _BLOCKED_TITLE_MARKERS):
+        return "challenge"
+    path = url.split("?", 1)[0].lower()
+    if any(marker in path for marker in _AUTH_PATH_MARKERS):
+        return "login"
+    return None
+
+
 async def _explain_unusable_composer(
     page: Page,
     sel: Selectors,
@@ -659,6 +717,7 @@ async def _drive(
     # A wall is not "a login control exists on the page". It is "we cannot ask the
     # question", and the only honest test for that is to try to ask it.
     state.step("enter_prompt")
+    trace["url_at_submit"] = (await _page_state(page))[0]
     try:
         await _enter_prompt(page, sel, req.prompt, deadline, trace, discover=req.discover)
     except DeadlineExceeded:
@@ -674,6 +733,8 @@ async def _drive(
     state.step("read_answer")
     answer = await _read_answer(page, sel)
     citations = await _read_citations(page, sel)
+    final_url, final_title = await _page_state(page)
+    trace["final_url"], trace["final_title"] = final_url, final_title
 
     if req.discover:
         # The second dump is where the answer / streaming / citation classes become
@@ -686,6 +747,24 @@ async def _drive(
     # anonymous question and then demand an account. Re-checking here is what stops
     # that being reported as "the AI answered with nothing".
     if not answer:
+        # Page-level state FIRST, because it is the case a selector cannot see. A live run
+        # finished on chatgpt.com/api/auth/error titled "Just a moment..." with all eight
+        # selector classes matching zero, and reported an empty answer — which is
+        # `extraction_failed`, retryable, so the consumer would keep paying for sessions
+        # against a wall it could never get through.
+        state.step("blocked_page_check")
+        blocked_kind = _classify_blocked_page(final_url, final_title)
+        if blocked_kind is not None:
+            trace["blocked_page"] = blocked_kind
+            return InvocationResponse(
+                login_wall=blocked_kind == "login",
+                challenge=blocked_kind == "challenge",
+                observed_egress=egress, trace=trace, discovery=state.discovery,
+                error=(
+                    f"the session was bounced off the surface: {blocked_kind} page "
+                    f"{final_title!r} at {final_url}"
+                ),
+            )
         state.step("post_answer_wall_check")
         blocked = await _explain_unusable_composer(page, sel, state, None, when="after")
         if blocked is not None:

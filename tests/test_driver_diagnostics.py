@@ -703,6 +703,111 @@ def test_a_fill_that_sticks_is_not_retyped(monkeypatch):
     assert not page.keyboard.typed
 
 
+# --- the session can be bounced off the surface entirely --------------------------
+
+
+def _bounced_page(url, title):
+    """A page that redirects itself the moment the prompt is submitted."""
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [_TransientNode()],
+            "#answer": [],  # nothing to read: this is a different document now
+        }
+    )
+    real_type = page.title
+
+    async def bounced_title():
+        return title if page.url != "about:blank" else await real_type()
+
+    original_goto = page.goto
+
+    async def goto(u, timeout=None, wait_until=None):
+        result = await original_goto(u, timeout=timeout, wait_until=wait_until)
+        return result
+
+    page.goto = goto
+    page.title = bounced_title
+    # The keyboard press is what triggers the redirect on the real surface.
+    original_press = page.keyboard.press
+
+    async def press(key):
+        await original_press(key)
+        if key == "Enter":
+            page.url = url
+
+    page.keyboard.press = press
+    return page
+
+
+def test_being_bounced_to_a_cloudflare_interstitial_is_terminal_not_an_empty_answer(
+    monkeypatch,
+):
+    """The live failure. The run finished on chatgpt.com/api/auth/error titled "Just a
+    moment..." with all eight selector classes matching ZERO, and reported "no answer text
+    matched the answer selector" - which is extraction_failed, which is RETRYABLE. So the
+    consumer would keep buying paid sessions against a wall it can never get through.
+
+    Neither the challenge nor the login selectors match Cloudflare's interstitial. The
+    signals that do are the title and the URL, and no CSS selector can carry those.
+    """
+    page = _bounced_page("https://chatgpt.com/api/auth/error", "Just a moment...")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.answer_text == ""
+    assert result.challenge is True, "an interstitial was reported as a retryable empty answer"
+    assert result.trace["blocked_page"] == "challenge"
+    assert "Just a moment" in (result.error or "")
+    assert result.trace["final_url"] == "https://chatgpt.com/api/auth/error"
+
+
+def test_an_auth_path_with_no_interstitial_title_is_read_as_a_login_wall(monkeypatch):
+    page = _bounced_page("https://chatgpt.com/api/auth/error", "Sign in")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True
+    assert result.challenge is False
+    assert result.trace["blocked_page"] == "login"
+
+
+def test_a_normal_conversation_url_is_not_treated_as_a_bounce(monkeypatch):
+    """The critical negative. chatgpt.com navigates from / to /c/<id> on submitting, so a
+    URL change is the SUCCESS path - a check that flagged any navigation would fail every
+    healthy run."""
+    page = _bounced_page("https://chatgpt.com/c/abc123", "Best auto repair in Franklin")
+    page.dom["#answer"] = [FakeNode(text="Franklin Auto Care is well reviewed.")]
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.answer_text == "Franklin Auto Care is well reviewed."
+    assert result.login_wall is False
+    assert result.challenge is False
+    assert "blocked_page" not in result.trace
+
+
+def test_an_empty_answer_on_the_surface_itself_stays_retryable(monkeypatch):
+    """A slow render is genuinely worth another attempt, so it must NOT be swept into the
+    terminal bucket - that would strand a run the surface would have answered."""
+    page = _bounced_page("https://chatgpt.com/c/abc123", "ChatGPT")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is False
+    assert result.challenge is False
+    assert result.error == "no answer text matched the answer selector"
+
+
+def test_the_url_is_recorded_at_submit_and_at_completion(monkeypatch):
+    """Both, because a navigation also satisfies wait_for("hidden") - the element is gone
+    because the whole document is. The live run recorded
+    completion=streaming_selector_hidden while being bounced, so the strongest completion
+    signal we have was reporting a finished answer for a destroyed page."""
+    page = _bounced_page("https://chatgpt.com/api/auth/error", "Just a moment...")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.trace["url_at_submit"] == "https://chatgpt.com/"
+    assert result.trace["url_at_completion"] == "https://chatgpt.com/api/auth/error"
+    assert result.trace["url_at_submit"] != result.trace["url_at_completion"]
+
+
 # --- finding 3: discovery has to answer even when the drive does not --------------
 
 

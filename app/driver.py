@@ -23,6 +23,10 @@ the product presents to customers as the trustworthy one.
 4. **Never report an empty answer as a success with no explanation.** The consumer
    retries an unexplained empty answer, which buys a second paid session against the
    same wall. If the page was blocked, say which; otherwise put the reason in `error`.
+5. **Try the composer BEFORE deciding the page is walled.** `login_wall` is terminal
+   for the consumer, and "a login control exists" is not the same claim as "we cannot
+   ask the question" — chatgpt.com ships both on its ordinary landing page. See
+   `_explain_unusable_composer`.
 """
 
 from __future__ import annotations
@@ -82,6 +86,16 @@ _DISCOVERY_SAMPLE_LIMIT = 25
 
 class DeadlineExceeded(Exception):
     """Our own budget ran out. Distinct from a Playwright timeout on one step."""
+
+
+class PromptNotEntered(Exception):
+    """The prompt did not end up in the composer, so there is nothing to submit.
+
+    Raised rather than warned about, because the alternative is pressing Enter on an
+    empty composer: the surface then answers whatever was already on screen — or
+    nothing — and that gets filed as a measured answer to OUR prompt. There is no
+    downstream check that can catch it.
+    """
 
 
 class _DriveState:
@@ -343,9 +357,12 @@ async def _enter_prompt(
         await page.keyboard.press("ControlOrMeta+a")
         await page.keyboard.type(prompt, delay=5)
         trace["input_method"] += "+retyped"
-        trace["input_readback_2"] = (
-            "ok" if prompt[:40] in await _read_field_text(field) else "still_lost"
-        )
+        if prompt[:40] not in await _read_field_text(field):
+            trace["input_readback_2"] = "still_lost"
+            raise PromptNotEntered(
+                "the prompt did not stay in the composer after fill and re-typing"
+            )
+        trace["input_readback_2"] = "ok"
     else:
         trace["input_readback"] = "ok"
 
@@ -545,6 +562,48 @@ async def _read_citations(page: Page, sel: Selectors) -> list[Citation]:
     return list(found.values())
 
 
+async def _explain_unusable_composer(
+    page: Page,
+    sel: Selectors,
+    state: _DriveState,
+    cause: Exception | None,
+    *,
+    when: str,
+) -> InvocationResponse | None:
+    """Was the page walled or challenged? Returns None when it was neither.
+
+    Called at the two moments a wall actually matters — the composer could not be used,
+    or it was used and produced no answer — and never as a pre-emptive gate. Several
+    surfaces allow one anonymous question and demand an account only afterwards, which is
+    why the second call site exists at all.
+
+    Returning None is significant: it means the page was not walled, so whatever went
+    wrong is ours (a selector, a timing) and must surface as an error rather than as a
+    terminal `login_wall` the consumer will never retry.
+    """
+    trace = state.trace
+    detail = f" ({type(cause).__name__}: {cause})" if cause else ""
+    suffix = "" if when == "before" else " after submitting"
+
+    blocked_by = await _first_visible(page, sel.login_wall)
+    if blocked_by:
+        trace["login_wall_selector"] = blocked_by
+        return InvocationResponse(
+            login_wall=True, observed_egress=state.egress, trace=trace,
+            discovery=state.discovery,
+            error=f"login wall{suffix}; matched {blocked_by!r}{detail}",
+        )
+    challenged_by = await _first_visible(page, sel.challenge)
+    if challenged_by:
+        trace["challenge_selector"] = challenged_by
+        return InvocationResponse(
+            challenge=True, observed_egress=state.egress, trace=trace,
+            discovery=state.discovery,
+            error=f"challenge{suffix}; matched {challenged_by!r}{detail}",
+        )
+    return None
+
+
 async def _drive(
     page: Page, req: InvocationRequest, deadline: _Deadline, state: _DriveState
 ) -> InvocationResponse:
@@ -572,27 +631,29 @@ async def _drive(
         state.step("discover_on_load")
         state.discovery = {"on_load": await _discover(page, sel, "on_load")}
 
-    state.step("login_wall_check")
-    blocked_by = await _first_visible(page, sel.login_wall)
-    if blocked_by:
-        trace["login_wall_selector"] = blocked_by
-        return InvocationResponse(
-            login_wall=True, observed_egress=egress, trace=trace,
-            discovery=state.discovery,
-            error=f"login wall matched {blocked_by!r}",
-        )
-    state.step("challenge_check")
-    challenged_by = await _first_visible(page, sel.challenge)
-    if challenged_by:
-        trace["challenge_selector"] = challenged_by
-        return InvocationResponse(
-            challenge=True, observed_egress=egress, trace=trace,
-            discovery=state.discovery,
-            error=f"challenge matched {challenged_by!r}",
-        )
-
+    # COMPOSER FIRST. The wall and challenge selectors are consulted only to EXPLAIN a
+    # failure to use the composer — never as a gate before trying.
+    #
+    # They used to gate. The first live discovery run returned `login_wall=True` without
+    # typing anything, because chatgpt.com carries `data-testid='login-button'` and
+    # `data-testid='signup-button'` as permanent header chrome on its ordinary logged-out
+    # landing page, right next to a working composer. `login_wall` is TERMINAL for the
+    # consumer, so every ground-truth job on that surface would have reported "cannot
+    # measure here" forever, and from the outside that is indistinguishable from a surface
+    # that genuinely walls us.
+    #
+    # A wall is not "a login control exists on the page". It is "we cannot ask the
+    # question", and the only honest test for that is to try to ask it.
     state.step("enter_prompt")
-    await _enter_prompt(page, sel, req.prompt, deadline, trace)
+    try:
+        await _enter_prompt(page, sel, req.prompt, deadline, trace)
+    except DeadlineExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        blocked = await _explain_unusable_composer(page, sel, state, exc, when="before")
+        if blocked is not None:
+            return blocked
+        raise
     state.step("await_completion")
     await _await_completion(page, sel, deadline, trace)
 
@@ -612,22 +673,9 @@ async def _drive(
     # that being reported as "the AI answered with nothing".
     if not answer:
         state.step("post_answer_wall_check")
-        blocked_by = await _first_visible(page, sel.login_wall)
-        if blocked_by:
-            trace["login_wall_selector"] = blocked_by
-            return InvocationResponse(
-                login_wall=True, observed_egress=egress, trace=trace,
-                discovery=state.discovery,
-                error=f"login wall appeared after submitting; matched {blocked_by!r}",
-            )
-        challenged_by = await _first_visible(page, sel.challenge)
-        if challenged_by:
-            trace["challenge_selector"] = challenged_by
-            return InvocationResponse(
-                challenge=True, observed_egress=egress, trace=trace,
-                discovery=state.discovery,
-                error=f"challenge appeared after submitting; matched {challenged_by!r}",
-            )
+        blocked = await _explain_unusable_composer(page, sel, state, None, when="after")
+        if blocked is not None:
+            return blocked
 
     state.step("done")
     return InvocationResponse(

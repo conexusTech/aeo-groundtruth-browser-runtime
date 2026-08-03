@@ -320,6 +320,11 @@ def _request(dom_selectors, **overrides):
             "challenge": ["#captcha"],
             "citation": ["#cite"],
         },
+        # A backstop, not a behaviour under test. The stability fallback is bounded only
+        # by this budget, so a fake whose answer never stabilises otherwise burns the
+        # production default (165s) inside a unit test. Every step here is instant, so
+        # nothing legitimate comes close to it.
+        "timeout_seconds": 8.0,
     }
     payload["selectors"].update(dom_selectors)
     payload.update(overrides)
@@ -451,13 +456,12 @@ def test_a_hidden_first_match_does_not_hide_the_real_composer(monkeypatch):
 
 def test_a_login_wall_whose_first_match_is_hidden_is_still_detected(monkeypatch):
     """The costly direction. Missing the wall reports an empty answer instead, which the
-    consumer RETRIES - buying a second paid session against the same wall."""
-    page = FakePage(
-        {
-            "#login": [FakeNode(visible=False), FakeNode(visible=True)],
-            "#composer": [FakeNode(visible=True, value="")],
-        }
-    )
+    consumer RETRIES - buying a second paid session against the same wall.
+
+    The composer is absent here, because a wall is only consulted once the composer
+    cannot be used - see the composer-first tests below.
+    """
+    page = FakePage({"#login": [FakeNode(visible=False), FakeNode(visible=True)]})
     result = _run(_request({}), page, monkeypatch)
 
     assert result.login_wall is True
@@ -478,6 +482,128 @@ def test_a_wall_with_only_hidden_matches_is_not_a_wall(monkeypatch):
     result = _run(_request({}), page, monkeypatch)
     assert result.login_wall is False
     assert result.answer_text == "An answer."
+
+
+# --- rule 5: the composer is tried BEFORE the page is called walled ---------------
+
+
+def test_a_visible_login_button_next_to_a_working_composer_is_not_a_wall(monkeypatch):
+    """Exactly the live page. chatgpt.com's logged-out landing page carries
+    `data-testid='login-button'` AND `data-testid='signup-button'` as permanent header
+    chrome, beside a working composer. The old pre-emptive gate returned
+    `login_wall=True` without typing a word - and login_wall is TERMINAL, so every
+    ground-truth job on that surface would report "cannot measure here" forever, which
+    from the outside is indistinguishable from a surface that really does wall us."""
+    page = FakePage(
+        {
+            "#login": [FakeNode(visible=True, text="Log in")],
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode()],
+            "#answer": [FakeNode(text="Franklin Auto Care is well reviewed.")],
+        }
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is False, (
+        "page furniture was treated as a wall; the run never asked the question"
+    )
+    assert result.answer_text == "Franklin Auto Care is well reviewed."
+    assert "login_wall_selector" not in result.trace
+
+
+def test_a_wall_is_reported_when_the_composer_really_cannot_be_used(monkeypatch):
+    """The gate still has to fire when it means something - here the wall is up and there
+    is no usable composer behind it."""
+    page = FakePage(
+        {
+            "#login": [FakeNode(visible=True, text="Log in to continue")],
+            "#composer": [FakeNode(visible=False)],
+        }
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True
+    assert result.trace["step"] == "enter_prompt"
+    # The Playwright cause is kept: "walled" and "walled AND our selector timed out" are
+    # different follow-ups, and only one of them is someone else's problem.
+    assert "FakeTimeout" in (result.error or "")
+
+
+def test_an_unusable_composer_with_no_wall_is_an_error_not_a_wall(monkeypatch):
+    """The important negative. If nothing is walled, the fault is OURS - a selector or a
+    timing - and it must not be laundered into a terminal login_wall the consumer will
+    never retry."""
+    page = FakePage({"#composer": [FakeNode(visible=False)]})
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is False
+    assert result.challenge is False
+    assert result.error and "FakeTimeout" in result.error
+
+
+def test_a_challenge_is_still_reported_when_it_blocks_the_composer(monkeypatch):
+    page = FakePage(
+        {
+            "#captcha": [FakeNode(visible=True)],
+            "#composer": [FakeNode(visible=False)],
+        }
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.challenge is True
+    assert result.login_wall is False
+    assert result.trace["challenge_selector"] == "#captcha"
+
+
+def test_a_wall_that_appears_only_after_submitting_is_still_caught(monkeypatch):
+    """Several surfaces allow one anonymous question and demand an account afterwards.
+    That is the second call site, and it is why the check could not simply be deleted."""
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            # Transient, so completion is detected on the fast path. With a permanently
+            # visible indicator this test fell through to the text-stability loop, which
+            # never stabilises on an empty answer and so ran to the full 165s budget - it
+            # alone took 165 of the suite's 166 seconds.
+            "#streaming": [_TransientNode()],
+            "#answer": [],  # submitted fine, then nothing rendered
+            "#login": [FakeNode(visible=True, text="Sign in to continue")],
+        }
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True
+    assert "after submitting" in (result.error or "")
+
+
+def test_a_prompt_that_never_lands_in_the_composer_is_not_submitted(monkeypatch):
+    """Pressing Enter on an empty composer makes the surface answer whatever was already
+    on screen, and that gets filed as a measured answer to OUR prompt. Nothing downstream
+    can detect it, so it has to fail here."""
+
+    unwritable = FakeNode(visible=True, value="")
+
+    class SwallowingLocator(FakeLocator):
+        async def fill(self, value, timeout=None):
+            return None
+
+        async def input_value(self, timeout=None):
+            return ""  # and typing does not stick either
+
+        async def inner_text(self, timeout=None):
+            return ""
+
+    page = FakePage({"#composer": [unwritable], "#answer": [FakeNode(text="Welcome!")]})
+    original = page.locator
+    page.locator = lambda s: (
+        SwallowingLocator([unwritable]) if s == "#composer" else original(s)
+    )
+
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.answer_text == "", "a welcome message was about to be scored as the answer"
+    assert result.trace["input_readback_2"] == "still_lost"
+    assert "PromptNotEntered" in (result.error or "")
 
 
 def test_a_hidden_first_match_does_not_cost_us_the_streaming_signal(monkeypatch):

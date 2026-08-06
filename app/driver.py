@@ -595,22 +595,49 @@ async def _await_completion(
     started = time.monotonic()
     previous = -1
     stable_rounds = 0
+    #: Observed answer lengths, so `text_never_stabilized` can be diagnosed WITHOUT
+    #: another paid session. That verdict has two opposite causes and the code cannot
+    #: tell them apart, but the shape of this list can:
+    #:
+    #:   [1200, 1450, 1700, 1980]  still GROWING  -> genuinely slow, raise the cap
+    #:   [2502, 2504, 2502, 2504]  OSCILLATING    -> something in the container keeps
+    #:                                              mutating; a bigger cap changes
+    #:                                              nothing and the fix is a real
+    #:                                              streaming indicator
+    #:
+    #: chatgpt.com is the suspected case: its `businesses-map-widget` renders INSIDE the
+    #: answer container, so tile loading and attribution keep nudging the character count
+    #: while the prose itself finished long before. perplexity.ai has no map and has never
+    #: failed this way, which fits.
+    samples: list[int] = []
+
+    def _record() -> None:
+        # Last 10 only: enough to see growth-vs-oscillation, small enough that the
+        # envelope stays readable in a log line.
+        trace["stability_samples"] = samples[-10:]
+
     while stable_rounds < 3:
         if deadline.expired:
             trace["completion"] = "text_still_growing_at_deadline"
+            _record()
             return
         if (time.monotonic() - started) * 1000 >= _STABILITY_MAX_MS:
             trace["completion"] = "text_never_stabilized"
+            _record()
             return
         await asyncio.sleep(1.5)
         # PageGone propagates deliberately: no further polling can help, and `_drive`
         # turns it into an envelope that says so.
         current = len(await _read_answer(page, sel))
+        samples.append(current)
         if current == previous and current > 0:
             stable_rounds += 1
         else:
             stable_rounds = 0
         previous = current
+    # Recorded on the SUCCESS path too. Without it the samples only ever appear on a
+    # failure, so there is no baseline to compare a suspicious run against.
+    _record()
 
 
 #: Runs in the page. Reports what a selector ACTUALLY matches, including the elements

@@ -180,6 +180,8 @@ class FakePage:
         self.keyboard = FakeKeyboard()
         self.navigations: list[str] = []
         self.evaluated = 0
+        self.fingerprint_probes = 0
+        self.discovery_dumps = 0
 
     def locator(self, selector):
         return FakeLocator(self.dom.get(selector, []))
@@ -200,10 +202,22 @@ class FakePage:
     async def title(self):
         return "Fake Surface"
 
-    async def evaluate(self, script, args):
-        # `_DISCOVERY_JS` itself needs a real browser. What is asserted here is that the
-        # dump is requested, shaped and RETURNED even when the drive fails.
+    async def evaluate(self, script, args=None):
+        # `args` is optional because `_FINGERPRINT_JS` is evaluated WITHOUT any, and a
+        # two-argument-only signature made that call raise `TypeError` — which
+        # `_probe_fingerprint` catches, so the probe silently recorded an error and every
+        # test still passed. A fake that cannot express the call the implementation makes
+        # cannot falsify it.
         self.evaluated += 1
+        if args is None:
+            self.fingerprint_probes += 1
+            # Stand in for a headless browser: the markers the stealth script targets.
+            return {"webdriver": True, "plugins": 0, "chrome_obj": "undefined"}
+        # Counted apart from the fingerprint probe on purpose. "A normal run dumps
+        # nothing" is a real invariant about DISCOVERY, and folding both into one
+        # counter would have forced that assertion to be loosened to accommodate an
+        # unrelated feature — which is how a meaningful test quietly stops meaning it.
+        self.discovery_dumps += 1
         selector, limit = args
         nodes = self.dom.get(selector, [])
         return {
@@ -220,16 +234,27 @@ class FakePage:
 
 
 class FakeBrowser:
+    instances: list["FakeBrowser"] = []
+
     def __init__(self, page):
         self._page = page
         self.closed = False
+        self.init_scripts: list[str] = []
+        FakeBrowser.instances.append(self)
 
     @property
     def contexts(self):
         page = self._page
+        browser = self
 
         class Ctx:
             pages = [page]
+
+            async def add_init_script(self, script):
+                # Recorded on the BROWSER, not on this throwaway `Ctx` — `contexts` is a
+                # property that builds a new one per access, so state kept here would be
+                # discarded the moment anything read `contexts` again.
+                browser.init_scripts.append(script)
 
         return [Ctx()]
 
@@ -262,6 +287,7 @@ class FakeBrowserClient:
 
 def _install(monkeypatch, page, *, start_error=None):
     FakeBrowserClient.instances.clear()
+    FakeBrowser.instances.clear()
 
     def make_client(region=None):
         client = FakeBrowserClient(region=region)
@@ -737,6 +763,66 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     assert result.challenge is False
 
 
+def test_the_stealth_script_is_registered_before_anything_navigates(monkeypatch):
+    """An init script only applies to documents loaded AFTER it is registered.
+
+    Registering it once `_drive` has started would patch nothing on the surface, and
+    nothing would error — the fingerprint would simply stay automated and the whole
+    experiment would silently measure the unpatched browser. The egress lookup navigates
+    first, so "before any goto" is the requirement, not "before the surface".
+
+    ⚠️ This test exists because the first version could not fail. `Ctx` had no
+    `add_init_script`, so the call raised `AttributeError`, `run_invocation` caught it,
+    recorded `stealth='failed'` — and all 71 tests still passed.
+    """
+    # Advance-per-read clock: these pages never answer, so with the real clock
+    # each one spins the appear loop for the whole 8s budget - 24s of suite time
+    # for three tests that are not about timing at all.
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+    result = _run(_request({}), page, monkeypatch)
+
+    browser = FakeBrowser.instances[0]
+    assert len(browser.init_scripts) == 1, "no stealth script was registered"
+    assert "webdriver" in browser.init_scripts[0]
+    assert result.trace["stealth"] == "applied"
+
+
+def test_stealth_can_be_turned_off_for_a_control_run(monkeypatch):
+    """The off switch is what makes this measurable rather than a belief.
+
+    A rate change means nothing without a control, and `stealth=False` is the control —
+    one session reporting the RAW fingerprint that the patched runs are compared against.
+    """
+    # Advance-per-read clock: these pages never answer, so with the real clock
+    # each one spins the appear loop for the whole 8s budget - 24s of suite time
+    # for three tests that are not about timing at all.
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+    result = _run(_request({}, stealth=False), page, monkeypatch)
+
+    assert FakeBrowser.instances[0].init_scripts == []
+    assert result.trace["stealth"] == "off"
+
+
+def test_the_fingerprint_is_probed_on_a_failed_run_too(monkeypatch):
+    """The comparison that matters is walled-session vs answered-session, so a probe that
+    only ran on success would compare nothing. This page never answers."""
+    # Advance-per-read clock: these pages never answer, so with the real clock
+    # each one spins the appear loop for the whole 8s budget - 24s of suite time
+    # for three tests that are not about timing at all.
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")], "#answer": []})
+    # Budget raised well above the stepping clock: at 5s per READ the 8s default
+    # expires during the egress lookup, so `_drive` never reaches the probe and the
+    # test fails for a reason that has nothing to do with fingerprinting.
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.answer_text == ""
+    assert page.fingerprint_probes >= 1, "the fingerprint was never read"
+    assert result.trace["fingerprint"]["webdriver"] is True
+
+
 class _SteppingClock:
     """A monotonic clock that advances a fixed amount on every READ.
 
@@ -1182,7 +1268,7 @@ def test_a_normal_run_still_dismisses_consent_and_dumps_nothing(monkeypatch):
     assert accept.clicked is True
     assert result.trace["consent_dismissed"] == ["#accept"]
     assert result.discovery is None
-    assert page.evaluated == 0
+    assert page.discovery_dumps == 0
 
 
 def test_consent_skips_a_hidden_candidate_rather_than_clicking_it(monkeypatch):

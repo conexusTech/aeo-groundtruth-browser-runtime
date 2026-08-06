@@ -91,6 +91,23 @@ class InvocationRequest(BaseModel):
     #: invocation with /ping polling**, not a bigger number here — that is the pattern the
     #: earlier AgentCore scan work landed on for exactly this reason.
     timeout_seconds: float = 90.0
+    #: Patch the automation markers a bot-detection script reads, before any page
+    #: script runs.
+    #:
+    #: 🔴 Why this exists. chatgpt.com answers roughly 20-50% of ground-truth prompts and
+    #: bounces the rest to `auth.openai.com/log-in-or-create-account`, while perplexity.ai
+    #: answers 80-100% **from the same residential IPs** — one exit
+    #: (`138.28.180.139`) was walled by chatgpt and served perplexity twice. So it is not
+    #: the proxy pool, and the traces of a session that answered and one that was walled
+    #: are byte-identical in everything we control (`input_method`, `submit_method`,
+    #: consent). The remaining difference is what the page can observe about the browser.
+    #:
+    #: ⚠️ This is a lever on the RATE, not a fix. A purely static fingerprint would fail
+    #: 100% of the time rather than 50-80%, so detection cannot be fingerprint alone —
+    #: the model that fits intermittency is a risk SCORE (IP reputation x fingerprint x
+    #: behaviour) crossing a threshold. Lowering one term should move the rate; only
+    #: measurement says by how much, which is what `trace.fingerprint` is for.
+    stealth: bool = True
 
 
 class Citation(BaseModel):

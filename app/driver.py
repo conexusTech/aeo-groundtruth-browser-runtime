@@ -792,6 +792,109 @@ async def _discover(page: Page, sel: Selectors, phase: str) -> dict[str, Any]:
     return out
 
 
+#: Reads the automation markers a bot-detection script reads. Diagnostic ONLY — it
+#: mutates nothing, and it runs on every invocation so a rate change is always
+#: attributable to a fingerprint that was actually measured rather than assumed.
+#:
+#: Recorded because the alternative is guessing which marker mattered. chatgpt.com walls
+#: 50-80% of our sessions while perplexity.ai answers 80-100% from the same residential
+#: IPs, and no field we control differs between a session that answered and one that was
+#: walled — so the difference is something the PAGE can see and we could not.
+_FINGERPRINT_JS = """
+() => {
+  const out = {};
+  try { out.webdriver = navigator.webdriver; } catch (e) { out.webdriver = 'err'; }
+  try {
+    out.ua_headless = /headless/i.test(navigator.userAgent);
+    out.ua = navigator.userAgent.slice(0, 120);
+  } catch (e) { out.ua = 'err'; }
+  try { out.plugins = navigator.plugins.length; } catch (e) { out.plugins = 'err'; }
+  try { out.languages = (navigator.languages || []).join(','); } catch (e) {}
+  try { out.chrome_obj = typeof window.chrome; } catch (e) {}
+  try { out.cores = navigator.hardwareConcurrency; } catch (e) {}
+  try { out.mem = navigator.deviceMemory; } catch (e) {}
+  try { out.platform = navigator.platform; } catch (e) {}
+  try { out.vendor = navigator.vendor; } catch (e) {}
+  try { out.screen = screen.width + 'x' + screen.height; } catch (e) {}
+  try { out.viewport = innerWidth + 'x' + innerHeight; } catch (e) {}
+  // Chromedriver leaves `cdc_`-prefixed keys on document. Their presence is a
+  // give-away that no user-agent string can disguise.
+  try {
+    out.cdc_keys = Object.keys(document).filter((k) => k.indexOf('cdc_') === 0).length;
+  } catch (e) {}
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg) {
+      out.webgl_vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+      out.webgl_renderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)).slice(0, 60);
+    }
+  } catch (e) {}
+  return out;
+}
+"""
+
+#: Runs BEFORE any page script, on every frame. Patches the markers `_FINGERPRINT_JS`
+#: reports, so the two are deliberately paired: whatever this claims to fix, the probe
+#: on the same run says whether it actually did.
+#:
+#: ⚠️ Every patch here is a lie told to the page, and the honest framing matters for
+#: whoever reads this next: we are not defeating detection, we are removing signals that
+#: mark an ordinary browser as automated. If chatgpt.com's rate does not move, the
+#: hypothesis was wrong and this should be REMOVED rather than extended — an
+#: ever-growing stealth script that never moved a number is how this kind of code rots.
+_STEALTH_JS = """
+() => {
+  // `navigator.webdriver` is true under CDP and is the single most-read marker.
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+      get: () => undefined, configurable: true,
+    });
+  } catch (e) {}
+  // A real Chrome exposes `window.chrome`; headless often does not.
+  try {
+    if (!window.chrome) {
+      window.chrome = { runtime: {}, app: { isInstalled: false } };
+    }
+  } catch (e) {}
+  // Zero plugins and zero languages are both strong headless tells.
+  try {
+    if (navigator.plugins && navigator.plugins.length === 0) {
+      Object.defineProperty(Navigator.prototype, 'plugins', {
+        get: () => [1, 2, 3, 4, 5], configurable: true,
+      });
+    }
+  } catch (e) {}
+  try {
+    if (!navigator.languages || navigator.languages.length === 0) {
+      Object.defineProperty(Navigator.prototype, 'languages', {
+        get: () => ['en-US', 'en'], configurable: true,
+      });
+    }
+  } catch (e) {}
+  // Headless answers `Notification.permission === 'denied'` while reporting
+  // `prompt` from permissions.query — a self-contradiction that is cheap to test for.
+  try {
+    const original = navigator.permissions && navigator.permissions.query;
+    if (original) {
+      navigator.permissions.query = (params) =>
+        params && params.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : original.call(navigator.permissions, params);
+    }
+  } catch (e) {}
+}
+"""
+
+
+async def _probe_fingerprint(page: Page, trace: dict) -> None:
+    """Record what the page can observe about this browser. Never fails the run."""
+    try:
+        trace["fingerprint"] = await page.evaluate(_FINGERPRINT_JS)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not cost a paid session
+        trace["fingerprint"] = {"error": f"{type(exc).__name__}"}
+
+
 class PageGone(Exception):
     """The page, context or browser closed under us. No further waiting can help.
 
@@ -956,6 +1059,11 @@ async def _drive(
     await page.goto(
         req.url, timeout=deadline.remaining_ms(_NAV_TIMEOUT_MS), wait_until="domcontentloaded"
     )
+    # Read on the SURFACE's own document, not the egress lookup's, because that is the
+    # context whose scripts do the scoring. Runs on success and failure alike, so a
+    # walled session and an answered one can be compared on the same fields.
+    await _probe_fingerprint(page, trace)
+
     state.step("consent")
     await _dismiss_consent(page, sel.consent, trace, discover=req.discover)
 
@@ -1090,6 +1198,19 @@ async def run_invocation(req: InvocationRequest, region: str) -> InvocationRespo
                 # open a second browser context that the proxy flag was not applied
                 # to at startup.
                 context = browser.contexts[0]
+                # BEFORE any navigation, including the egress lookup — an init script
+                # only applies to documents loaded after it is registered, so
+                # registering it after `_drive` starts would silently patch nothing.
+                if req.stealth:
+                    try:
+                        await context.add_init_script(_STEALTH_JS)
+                        state.trace["stealth"] = "applied"
+                    except Exception as exc:  # noqa: BLE001
+                        # Recorded, not raised: this is an optimisation, and failing the
+                        # invocation over it would trade a measurable answer for none.
+                        state.trace["stealth"] = f"failed: {type(exc).__name__}"
+                else:
+                    state.trace["stealth"] = "off"
                 page = context.pages[0] if context.pages else await context.new_page()
                 page.set_default_timeout(_NAV_TIMEOUT_MS)
                 return await _drive(page, req, deadline, state)

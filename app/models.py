@@ -134,6 +134,25 @@ class ObservedEgress(BaseModel):
     #: back to the name comparison, so this stays optional.
     lat: float | None = None
     lon: float | None = None
+    #: 🔑 What BRIGHT DATA says it gave us — `lum_city` / `lum_region` from their own
+    #: `geo.brdtest.com/mygeo.json`. **Added 2026-08-06, and the consumer treats it as
+    #: AUTHORITATIVE over every other field here.**
+    #:
+    #: It answers a different question from the rest of this object, and that difference
+    #: is the whole point. `city` above is an IP-geolocation *observation* — a third party
+    #: guessing where an address sits, and it routinely names the metro instead of the
+    #: suburb (a genuine Franklin, TN exit came back "Nashville", 28 km off). These two
+    #: are the vendor's *intent*: the town its targeting actually selected.
+    #:
+    #: The PRD promises measurement "geo-targeted to the tenant's town", so the product
+    #: question is which TOWN we came out in — and only the vendor can answer that
+    #: exactly. Judging it by IP geolocation forced a distance tolerance eight times
+    #: wider than a town, purely to absorb the instrument's error.
+    #:
+    #: Optional: if their endpoint is unreachable the consumer falls back to comparing
+    #: distance, which still works and is merely blunter.
+    proxy_city: str | None = None
+    proxy_region: str | None = None
 
 
 class InvocationResponse(BaseModel):

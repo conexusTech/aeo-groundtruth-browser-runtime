@@ -144,6 +144,39 @@ def test_ip_api_coordinates_come_out_of_two_numeric_fields(payload, expected):
     assert _coords_from_fields(payload) == expected
 
 
+def test_observed_egress_carries_the_proxys_own_view():
+    """Added 2026-08-06 and the consumer treats these as AUTHORITATIVE.
+
+    They answer a different question from `city`: that field is a third party guessing a
+    town from an IP address, and it named the metro instead of the suburb often enough to
+    discard correct paid sessions. `proxy_city` is Bright Data reporting which town its
+    own targeting selected — the exact question the PRD's "geo-targeted to the tenant's
+    town" asks.
+
+    Optional, because the consumer must keep working against a runtime that cannot reach
+    the vendor endpoint; it falls back to distance, which is blunter but functional."""
+    from app.models import ObservedEgress
+
+    assert {"proxy_city", "proxy_region"} <= set(ObservedEgress().model_dump())
+    blank = ObservedEgress()
+    assert blank.proxy_city is None and blank.proxy_region is None
+
+
+def test_the_proxy_view_is_a_separate_request_from_the_geolocation_loop():
+    """Structural, and it guards a subtle regression.
+
+    The IP-geolocation providers are interchangeable observers of one fact, so the loop
+    stops at the first that answers. The proxy's self-report is a DIFFERENT fact and has
+    to be fetched whichever of them won. Folding it in as another list entry would mean
+    it is skipped exactly when ipinfo answers first — i.e. nearly always — and the
+    authoritative signal would silently never arrive."""
+    from app import driver
+
+    urls = [url for _, url, _, _ in driver._EGRESS_PROVIDERS]
+    assert driver._PROXY_VIEW_URL not in urls
+    assert "brdtest" in driver._PROXY_VIEW_URL
+
+
 # --- payload acceptance ---------------------------------------------------------
 
 

@@ -232,12 +232,57 @@ def build_proxy_configuration(req: InvocationRequest) -> ProxyConfiguration | No
     )
 
 
+#: Bright Data's own endpoint. Not an IP-geolocation provider — it is the VENDOR
+#: reporting which town its targeting selected (`lum_city` / `lum_region`), which is the
+#: only exact answer to "did we egress from the tenant's town" that exists. Everything
+#: else on this path is a third party guessing from an IP address.
+_PROXY_VIEW_URL = "https://geo.brdtest.com/mygeo.json"
+
+
+async def _read_proxy_view(page: Page, deadline: _Deadline) -> tuple[str | None, str | None]:
+    """What Bright Data believes it gave us. `(None, None)` if it cannot be reached.
+
+    Deliberately a SEPARATE request from the IP-geolocation loop rather than another
+    entry in it. Those providers are interchangeable observers of the same fact and the
+    loop stops at the first that answers; this is a different fact entirely and must be
+    fetched whichever of them won. Folding it into the list would mean it is skipped
+    exactly when ipinfo happens to answer first — i.e. almost always.
+    """
+    try:
+        response = await page.goto(
+            _PROXY_VIEW_URL,
+            timeout=deadline.remaining_ms(_EGRESS_TIMEOUT_MS),
+            wait_until="domcontentloaded",
+        )
+        if response is None or not response.ok:
+            logger.warning("proxy self-report returned no usable response")
+            return None, None
+        payload = json.loads(await response.text())
+    except DeadlineExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unreachable vendor endpoint is survivable
+        logger.warning("proxy self-report failed: %s", exc)
+        return None, None
+
+    geo = payload.get("geo") or {}
+    city = geo.get("lum_city") or None
+    region = geo.get("lum_region") or None
+    logger.info("proxy self-report: lum_city=%s lum_region=%s", city, region)
+    return city, region
+
+
 async def _read_egress(page: Page, deadline: _Deadline) -> ObservedEgress | None:
     """Ask an IP-geolocation endpoint, from inside the session, where we are.
 
     Returns None only when every provider failed, which the consumer treats as a
     mismatch — unverifiable geography is not a result.
+
+    Also asks the PROXY itself which town it selected; see `_read_proxy_view`. That
+    answer is what the consumer prefers, because it is the vendor's intent rather than a
+    third party's guess at an address.
     """
+    proxy_city, proxy_region = await _read_proxy_view(page, deadline)
+
     for name, url, (city_key, region_key, ip_key), coords in _EGRESS_PROVIDERS:
         try:
             response = await page.goto(
@@ -267,6 +312,8 @@ async def _read_egress(page: Page, deadline: _Deadline) -> ObservedEgress | None
             source=name,
             lat=lat,
             lon=lon,
+            proxy_city=proxy_city,
+            proxy_region=proxy_region,
         )
         # Still keyed on `city`, not on coordinates. A provider that answers with a city
         # and no `loc` is degraded, not useless — the consumer falls back to comparing
@@ -276,6 +323,15 @@ async def _read_egress(page: Page, deadline: _Deadline) -> ObservedEgress | None
         if egress.city:
             return egress
         logger.warning("egress provider %s answered without a city", name)
+
+    # Every IP-geolocation provider failed, but the proxy itself answered — so we DO know
+    # which town it selected, which is the question that actually matters. Returning None
+    # here would throw that away and the consumer would fail the job as unverifiable.
+    if proxy_city:
+        logger.warning(
+            "no IP-geolocation provider answered; reporting the proxy's own view only"
+        )
+        return ObservedEgress(proxy_city=proxy_city, proxy_region=proxy_region)
     return None
 
 

@@ -36,6 +36,7 @@ import json
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from bedrock_agentcore.tools.browser_client import BrowserClient
 from bedrock_agentcore.tools.config import (
@@ -152,7 +153,47 @@ _BLOCKED_TITLE_MARKERS = (
     "verifying you are human",
     "checking your browser",
 )
-_AUTH_PATH_MARKERS = ("/auth/error", "/auth/login", "/api/auth", "/login")
+#: First hostname label of a host that exists only to authenticate. Anything served from
+#: one is a wall by construction, whatever the path — and the path is exactly what the
+#: old substring check got wrong.
+#:
+#: 🔴 The live failure this fixes (2026-08-06): two of six chatgpt.com ground-truth
+#: sessions finished on `https://auth.openai.com/log-in-or-create-account`, titled
+#: "Log in or sign up - OpenAI". A hard login wall — and `_classify_blocked_page`
+#: returned None for it, because `/log-in-or-create-account` contains NONE of the old
+#: markers (`/auth/error`, `/auth/login`, `/api/auth`, `/login`): `log-in` is not
+#: `login`. So a TERMINAL wall was filed as `extraction_failed`, which is in the
+#: consumer's `RETRYABLE_CODES`, and every walled prompt bought a SECOND paid session
+#: against a wall it could never get through — the precise outcome
+#: `_classify_blocked_page` exists to prevent.
+_AUTH_HOST_LABELS = frozenset({"auth", "accounts", "login", "signin"})
+
+#: Path SEGMENTS, matched by EQUALITY rather than as substrings, which is the other half
+#: of the fix.
+#:
+#: ⚠️ Substring matching here is not merely imprecise, it is dangerous in the expensive
+#: direction. Perplexity puts the question itself in the answer URL as a slug, so a
+#: customer asking about signing in yields `/search/login-problems-with-…`, and
+#: `"/login" in url` fires on it. That matters precisely when the answer selector MISSED
+#: — which perplexity.ai did on 2026-08-06 — because the blocked-page check only runs on
+#: an empty answer. Substring matching would upgrade that retryable extraction failure
+#: into a TERMINAL login wall: the surface silently stops being measured and reports a
+#: wall that was never there. A missed wall costs one more session; this costs the
+#: measurement. Segment equality cannot be tripped by a slug, since a slug is never
+#: EQUAL to the bare word.
+_AUTH_PATH_SEGMENTS = frozenset(
+    {
+        "auth",
+        "login",
+        "log-in",
+        "signin",
+        "sign-in",
+        "signup",
+        "sign-up",
+        "create-account",
+        "log-in-or-create-account",
+    }
+)
 
 
 class DeadlineExceeded(Exception):
@@ -583,39 +624,67 @@ async def _await_completion(
                 raise PageGone(str(exc)) from exc
             trace["stream_appeared"] = trace.get("stream_appeared", False)
 
-    # Stability fallback: the answer is done when its length stops changing.
+    # Text fallback, in TWO phases: wait for the answer to APPEAR, then wait for it to
+    # SETTLE. They are separated because they are opposite failures with opposite fixes,
+    # and one clock covering both reported them identically.
     #
-    # Bounded by `_STABILITY_MAX_MS` as well as by the deadline. Letting it run to the
-    # full budget is what a live perplexity.ai run did: 164 seconds of paid session
-    # polling every 1.5s for an answer that never stabilised, then returning nothing. The
-    # deadline is the invocation's whole budget, so using it as this loop's only bound
-    # spends everything on the weakest signal we have — and if the answer has not settled
-    # in 90s it is not going to.
+    # 🔴 The run that forced this (2026-08-06). A perplexity.ai job reached
+    # `/search/<id>` titled with our own prompt — it had answered — and still failed,
+    # logging `samples=[0,0,0,0,0,0,0,0,0,0]` and `elapsed_s=84.33`: ~19s of overhead
+    # plus the 65s cap, exactly. The container had not RENDERED yet, because perplexity
+    # runs a web search first ("Searching the web", "10 sources"). The cap is the right
+    # bound for settling and the wrong bound for appearing, so a slow search was
+    # cancelled at 65s with ~35s of budget left unspent.
+    #
+    # The two shapes, which one clock could not tell apart:
+    #
+    #   [0, 0, 0, 0]              NEVER APPEARED -> slow render; spend the budget we have
+    #   [1200, 1450, 1700, 1980]  still GROWING  -> genuinely slow, raise the cap
+    #   [2502, 2504, 2502, 2504]  OSCILLATING    -> something in the container keeps
+    #                                               mutating; a bigger cap changes
+    #                                               nothing and the fix is a real
+    #                                               streaming indicator
+    #
+    # chatgpt.com's map widget is the suspected oscillator: its `businesses-map-widget`
+    # renders INSIDE the answer container, so tile loading keeps nudging the character
+    # count after the prose has finished.
+    samples: list[int] = []
+
+    def _record() -> None:
+        # Last 10 only: enough to see the shape, small enough that the envelope stays
+        # readable in a log line.
+        trace["stability_samples"] = samples[-10:]
+
+    # --- phase 1: appear. Bounded by the DEADLINE, not by `_STABILITY_MAX_MS`.
+    #
+    # Deliberately the whole remaining budget. There is nothing to settle until something
+    # renders, so time spent here is not time wasted on "the weakest signal we have" —
+    # that argument applies to the settle loop below, and applying it here is what
+    # cancelled a perplexity answer the session had already paid for.
+    trace["completion"] = "answer_never_appeared"
+    current = len(await _read_answer(page, sel))
+    samples.append(current)
+    while current == 0:
+        if deadline.expired:
+            _record()
+            return
+        await asyncio.sleep(1.5)
+        # PageGone propagates deliberately: no further polling can help, and `_drive`
+        # turns it into an envelope that says so.
+        current = len(await _read_answer(page, sel))
+        samples.append(current)
+
+    # --- phase 2: settle. The clock starts HERE, when the answer first appeared.
+    #
+    # Starting it at function entry is what made the cap govern rendering as well as
+    # settling. Bounded by `_STABILITY_MAX_MS` as well as by the deadline: a live
+    # perplexity.ai run once spent 164 seconds — its entire budget — polling text that
+    # never stabilised, and if it has not settled in a minute it is not going to.
+    trace["answer_appeared_after_polls"] = len(samples)
     trace["completion"] = "text_stabilized"
     started = time.monotonic()
     previous = -1
     stable_rounds = 0
-    #: Observed answer lengths, so `text_never_stabilized` can be diagnosed WITHOUT
-    #: another paid session. That verdict has two opposite causes and the code cannot
-    #: tell them apart, but the shape of this list can:
-    #:
-    #:   [1200, 1450, 1700, 1980]  still GROWING  -> genuinely slow, raise the cap
-    #:   [2502, 2504, 2502, 2504]  OSCILLATING    -> something in the container keeps
-    #:                                              mutating; a bigger cap changes
-    #:                                              nothing and the fix is a real
-    #:                                              streaming indicator
-    #:
-    #: chatgpt.com is the suspected case: its `businesses-map-widget` renders INSIDE the
-    #: answer container, so tile loading and attribution keep nudging the character count
-    #: while the prose itself finished long before. perplexity.ai has no map and has never
-    #: failed this way, which fits.
-    samples: list[int] = []
-
-    def _record() -> None:
-        # Last 10 only: enough to see growth-vs-oscillation, small enough that the
-        # envelope stays readable in a log line.
-        trace["stability_samples"] = samples[-10:]
-
     while stable_rounds < 3:
         if deadline.expired:
             trace["completion"] = "text_still_growing_at_deadline"
@@ -625,16 +694,16 @@ async def _await_completion(
             trace["completion"] = "text_never_stabilized"
             _record()
             return
-        await asyncio.sleep(1.5)
-        # PageGone propagates deliberately: no further polling can help, and `_drive`
-        # turns it into an envelope that says so.
-        current = len(await _read_answer(page, sel))
-        samples.append(current)
         if current == previous and current > 0:
             stable_rounds += 1
         else:
             stable_rounds = 0
         previous = current
+        if stable_rounds >= 3:
+            break
+        await asyncio.sleep(1.5)
+        current = len(await _read_answer(page, sel))
+        samples.append(current)
     # Recorded on the SUCCESS path too. Without it the samples only ever appear on a
     # failure, so there is no baseline to compare a suspicious run against.
     _record()
@@ -817,8 +886,13 @@ def _classify_blocked_page(url: str, title: str) -> str | None:
     lowered = title.strip().lower()
     if any(marker in lowered for marker in _BLOCKED_TITLE_MARKERS):
         return "challenge"
-    path = url.split("?", 1)[0].lower()
-    if any(marker in path for marker in _AUTH_PATH_MARKERS):
+    parts = urlsplit(url.lower())
+    # Host first. It is the signal that does not depend on guessing a vendor's path
+    # spelling, which is what let `auth.openai.com/log-in-or-create-account` through.
+    host = parts.hostname or ""
+    if host.split(".", 1)[0] in _AUTH_HOST_LABELS:
+        return "login"
+    if {segment for segment in parts.path.split("/") if segment} & _AUTH_PATH_SEGMENTS:
         return "login"
     return None
 

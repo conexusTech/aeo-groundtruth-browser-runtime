@@ -737,6 +737,106 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     assert result.challenge is False
 
 
+class _SteppingClock:
+    """A monotonic clock that advances a fixed amount on every READ.
+
+    `asyncio.sleep` is a no-op in this file, so wall-clock never moves — which means
+    neither the settle cap nor the deadline can ever be reached, and "the answer took
+    longer to render than the cap allows" is not expressible at all. Advancing per read
+    is what makes it testable without spending real seconds.
+    """
+
+    def __init__(self, step=5.0):
+        self.step = step
+        self.now = 0.0
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def _late_answer_page(text, appears_after):
+    """A page whose answer container matches nothing until the Nth read."""
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode(visible=False)],
+            "#answer": [FakeNode(text="")],
+        }
+    )
+    reads = {"n": 0}
+
+    class LateLocator(FakeLocator):
+        async def inner_text(self, timeout=None):
+            reads["n"] += 1
+            return text if reads["n"] > appears_after else ""
+
+    original = page.locator
+    page.locator = lambda s: (
+        LateLocator([FakeNode(text="")]) if s == "#answer" else original(s)
+    )
+    return page
+
+
+def test_a_slowly_rendering_answer_is_not_cancelled_by_the_settle_cap(monkeypatch):
+    """🔴 The live perplexity.ai failure of 2026-08-06, and the reason the wait is now
+    two phases rather than one clock.
+
+    That job reached `/search/<id>` titled with our own prompt — it HAD answered — and
+    still failed, logging `samples=[0,0,0,0,0,0,0,0,0,0]` at `elapsed_s=84.33`: about
+    19s of overhead plus the 65s cap, exactly. Perplexity runs a web search before it
+    renders ("Searching the web", "10 sources"), so the container simply had not appeared
+    yet, and the session was cancelled with ~35s of its budget unspent.
+
+    The cap is the right bound for text that will not SETTLE and the wrong bound for text
+    that has not APPEARED. Under the single-clock version this test reports
+    `text_never_stabilized` and returns no answer.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    answer = "Franklin Roof Co. is the most trusted roofer in Franklin, TN."
+    page = _late_answer_page(answer, appears_after=12)
+
+    result = _run(_request({}, timeout_seconds=100_000.0), page, monkeypatch)
+
+    assert result.answer_text == answer, (
+        "a slow render was cancelled by the settle cap, losing an answer the session "
+        "had already paid for"
+    )
+    assert result.trace["completion"] == "text_stabilized"
+    # The zeros are still recorded: the appear phase is where the diagnosis lives.
+    assert result.trace["stability_samples"], "the samples were dropped on the happy path"
+    assert result.trace["answer_appeared_after_polls"] > 1
+
+
+def test_an_answer_that_never_renders_is_distinguished_from_one_that_never_settles(
+    monkeypatch,
+):
+    """`samples=[0,0,…]` and `samples=[2502,2504,…]` are opposite faults with opposite
+    fixes, and the single-clock version reported BOTH as `text_never_stabilized`.
+
+    Never-appeared means the render is slow or the selector is wrong; never-settled means
+    something in the container keeps mutating and no cap will ever help. Tonight that
+    ambiguity is what made six chatgpt.com failures and one perplexity.ai failure look
+    like the same bug when they were nothing alike.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode(visible=False)],
+            "#answer": [],  # nothing ever matches
+        }
+    )
+
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.trace["completion"] == "answer_never_appeared", (
+        "a container that never rendered was reported as text that never stabilised"
+    )
+    assert set(result.trace["stability_samples"]) == {0}
+    assert "answer_appeared_after_polls" not in result.trace
+
+
 def test_the_stability_fallback_is_bounded_independently_of_the_deadline(monkeypatch):
     """A live perplexity.ai run spent 164 seconds - its entire budget - polling for an
     answer that never stabilised, then returned nothing. The deadline is the whole
@@ -841,6 +941,98 @@ def test_an_auth_path_with_no_interstitial_title_is_read_as_a_login_wall(monkeyp
 
     assert result.login_wall is True
     assert result.challenge is False
+    assert result.trace["blocked_page"] == "login"
+
+
+def test_openais_real_login_wall_is_terminal_not_a_retryable_empty_answer(monkeypatch):
+    """The live failure of 2026-08-06, and the reason the marker list stopped being
+    substrings.
+
+    Two of six chatgpt.com ground-truth sessions finished on
+    `https://auth.openai.com/log-in-or-create-account` titled "Log in or sign up -
+    OpenAI". That is a hard wall, but `_classify_blocked_page` returned None for it: the
+    old `_AUTH_PATH_MARKERS` were `/auth/error`, `/auth/login`, `/api/auth`, `/login`,
+    and `/log-in-or-create-account` contains NONE of them, because `log-in` is not
+    `login`.
+
+    So the run reported `extraction_failed`, which the consumer has in `RETRYABLE_CODES`,
+    and every walled prompt bought a SECOND paid session against the same wall. The title
+    is not a Cloudflare marker either, so nothing else caught it.
+    """
+    page = _bounced_page(
+        "https://auth.openai.com/log-in-or-create-account", "Log in or sign up - OpenAI"
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True, (
+        "a hard login wall was reported as a retryable empty answer, which buys another "
+        "paid session against the same wall"
+    )
+    assert result.challenge is False
+    assert result.trace["blocked_page"] == "login"
+    assert result.trace["final_url"] == "https://auth.openai.com/log-in-or-create-account"
+
+
+def test_an_auth_host_is_a_wall_whatever_the_path_is_called(monkeypatch):
+    """The host check is the half that does not depend on guessing a vendor's spelling.
+
+    `/log-in-or-create-account` was unguessable; `auth.` as the first hostname label was
+    not. A surface that renames the path tomorrow is still caught.
+    """
+    page = _bounced_page("https://auth.openai.com/totally-new-path", "Sign in")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True
+    assert result.trace["blocked_page"] == "login"
+
+
+def test_a_question_slug_about_logging_in_is_not_read_as_a_login_wall(monkeypatch):
+    """The false positive that segment-EQUALITY matching exists to prevent, and the
+    reason this is not just a longer substring list.
+
+    Perplexity puts the question itself in the answer URL as a slug, so a customer asking
+    anything about signing in yields `/search/login-problems-with-…`.
+
+    ⚠️ The answer is deliberately EMPTY here, and that is the whole test. `_drive` only
+    consults `_classify_blocked_page` when nothing was extracted, so a version of this
+    with an answer present never reaches the classifier and passes no matter what the
+    matching rule is — it was written that way first and survived the mutation.
+
+    Empty-answer-on-a-slug-URL is not hypothetical: it is exactly what perplexity.ai did
+    on 2026-08-06, reaching `/search/<id>` titled with our own prompt while `div.prose`
+    matched zero. Under substring matching, the same miss on a slug URL would be
+    upgraded from a retryable extraction failure to a TERMINAL login wall — the surface
+    silently stops being measured and reports a wall that was never there. A missed wall
+    costs one more session; this costs the measurement itself.
+    """
+    # The slug must START with the bare word, so the URL literally contains "/login" —
+    # otherwise this passes under the old substring list too and proves nothing.
+    page = _bounced_page(
+        "https://www.perplexity.ai/search/login-problems-with-my-router-x7f2",
+        "login problems with my router",
+    )
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is False, (
+        "a slug containing the word 'login' was read as a wall, which is terminal and "
+        "would stop the surface being measured at all"
+    )
+    assert result.challenge is False
+    assert "blocked_page" not in result.trace
+    assert result.error == "no answer text matched the answer selector"
+
+
+def test_an_auth_path_on_an_ordinary_host_is_still_a_wall(monkeypatch):
+    """The path list carries its own weight, independently of the host check.
+
+    Without this, `_AUTH_PATH_SEGMENTS` could be emptied entirely and every test would
+    still pass — `auth.openai.com` is caught by its hostname. This is the case that
+    breaks if OpenAI moves the same page onto the surface's own domain.
+    """
+    page = _bounced_page("https://chatgpt.com/log-in-or-create-account", "Log in")
+    result = _run(_request({}), page, monkeypatch)
+
+    assert result.login_wall is True
     assert result.trace["blocked_page"] == "login"
 
 

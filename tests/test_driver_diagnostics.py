@@ -233,13 +233,26 @@ class FakePage:
         pass
 
 
+class FakeCdpSession:
+    """Records CDP commands. `Emulation.setUserAgentOverride` is the one that matters:
+    it replaces the outgoing User-Agent HEADER as well as `navigator.userAgent`, which a
+    page-side init script cannot do."""
+
+    def __init__(self, browser):
+        self._browser = browser
+
+    async def send(self, method, params=None):
+        self._browser.cdp_calls.append((method, params or {}))
+        return {}
+
+
 class FakeBrowser:
     instances: list["FakeBrowser"] = []
 
     def __init__(self, page):
         self._page = page
         self.closed = False
-        self.init_scripts: list[str] = []
+        self.cdp_calls: list[tuple[str, dict]] = []
         FakeBrowser.instances.append(self)
 
     @property
@@ -250,11 +263,8 @@ class FakeBrowser:
         class Ctx:
             pages = [page]
 
-            async def add_init_script(self, script):
-                # Recorded on the BROWSER, not on this throwaway `Ctx` — `contexts` is a
-                # property that builds a new one per access, so state kept here would be
-                # discarded the moment anything read `contexts` again.
-                browser.init_scripts.append(script)
+            async def new_cdp_session(self, page):
+                return FakeCdpSession(browser)
 
         return [Ctx()]
 
@@ -763,46 +773,65 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     assert result.challenge is False
 
 
-def test_the_stealth_script_is_registered_before_anything_navigates(monkeypatch):
-    """An init script only applies to documents loaded AFTER it is registered.
+def test_the_self_identifying_user_agent_is_replaced_before_anything_navigates(monkeypatch):
+    """🔴 What the fingerprint probe actually found, and it killed the previous theory.
 
-    Registering it once `_drive` has started would patch nothing on the surface, and
-    nothing would error — the fingerprint would simply stay automated and the whole
-    experiment would silently measure the unpatched browser. The egress lookup navigates
-    first, so "before any goto" is the requirement, not "before the surface".
+    Every marker a stealth script normally patches was ALREADY clean on the AgentCore
+    browser — `webdriver: false`, `cdc_keys: 0`, `chrome_obj: 'object'`, `plugins: 5`,
+    `ua_headless: false`. The A/B proved it: `stealth=applied` produced a fingerprint
+    byte-identical to the control, and both were walled.
 
-    ⚠️ This test exists because the first version could not fail. `Ctx` had no
-    `add_init_script`, so the call raised `AttributeError`, `run_invocation` caught it,
-    recorded `stealth='failed'` — and all 71 tests still passed.
+    What the UA said instead was
+    `... Chrome/148.0.0.0 Amazon-Bedrock-AgentCore-Browser` — AWS appending a product
+    token that announces the browser as automated, on every HTTP request.
+
+    It must be overridden BEFORE the first navigation, because the UA travels as a
+    request HEADER and a request already sent cannot be un-sent. That is also why this is
+    a CDP `Emulation.setUserAgentOverride` and not an init script: an init script can
+    only reach `navigator.userAgent`, leaving the header untouched.
     """
-    # Advance-per-read clock: these pages never answer, so with the real clock
-    # each one spins the appear loop for the whole 8s budget - 24s of suite time
-    # for three tests that are not about timing at all.
     monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
     page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
     result = _run(_request({}), page, monkeypatch)
 
-    browser = FakeBrowser.instances[0]
-    assert len(browser.init_scripts) == 1, "no stealth script was registered"
-    assert "webdriver" in browser.init_scripts[0]
-    assert result.trace["stealth"] == "applied"
+    calls = dict(FakeBrowser.instances[0].cdp_calls)
+    assert "Emulation.setUserAgentOverride" in calls, "the UA was never overridden"
+    ua = calls["Emulation.setUserAgentOverride"]["userAgent"]
+    assert "Amazon" not in ua and "AgentCore" not in ua, (
+        "the UA still announces the browser as an automated AgentCore session"
+    )
+    assert result.trace["ua_masked"] is True
 
 
-def test_stealth_can_be_turned_off_for_a_control_run(monkeypatch):
-    """The off switch is what makes this measurable rather than a belief.
+def test_the_replacement_user_agent_stays_internally_consistent(monkeypatch):
+    """An INCONSISTENT fingerprint is a stronger bot signal than an unusual coherent one.
 
-    A rate change means nothing without a control, and `stealth=False` is the control —
-    one session reporting the RAW fingerprint that the patched runs are compared against.
+    Claiming Windows here would contradict `navigator.platform`, the WebGL renderer and
+    the Sec-CH-UA client hints, all of which still say Linux. So the replacement keeps
+    the platform and the Chrome major version and only drops the product token.
     """
-    # Advance-per-read clock: these pages never answer, so with the real clock
-    # each one spins the appear loop for the whole 8s budget - 24s of suite time
-    # for three tests that are not about timing at all.
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+    _run(_request({}), page, monkeypatch)
+
+    params = dict(FakeBrowser.instances[0].cdp_calls)["Emulation.setUserAgentOverride"]
+    assert "X11; Linux x86_64" in params["userAgent"]
+    assert params["platform"] == "Linux x86_64"
+    assert "Chrome/148" in params["userAgent"]
+    assert params["userAgent"].endswith("Safari/537.36"), (
+        "a real Chrome UA ends in Safari/537.36; the AgentCore one replaces it"
+    )
+
+
+def test_ua_masking_can_be_turned_off_for_a_control_run(monkeypatch):
+    """The off switch is what makes this measurable rather than a belief. It is the only
+    reason the previous hypothesis could be falsified instead of quietly believed."""
     monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
     page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
     result = _run(_request({}, stealth=False), page, monkeypatch)
 
-    assert FakeBrowser.instances[0].init_scripts == []
-    assert result.trace["stealth"] == "off"
+    assert FakeBrowser.instances[0].cdp_calls == []
+    assert result.trace["ua_masked"] == "off"
 
 
 def test_the_fingerprint_is_probed_on_a_failed_run_too(monkeypatch):

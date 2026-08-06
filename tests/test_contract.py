@@ -89,6 +89,61 @@ def test_observed_egress_uses_city_and_region():
     assert {"city", "region"} <= set(ObservedEgress().model_dump())
 
 
+def test_observed_egress_carries_coordinates():
+    """Added 2026-08-06. The consumer PREFERS these over the city name, because a
+    residential exit in Franklin, TN gets reported as "Nashville" (the metro) often
+    enough to discard correct paid sessions - `geo_egress_mismatch` is terminal.
+
+    Renaming or dropping these does NOT fail loudly the way `city` does: the consumer
+    silently falls back to comparing names, restoring the intermittent false failure
+    with nothing anywhere reporting a change. That asymmetry is why this is pinned."""
+    from app.models import ObservedEgress
+
+    assert {"lat", "lon"} <= set(ObservedEgress().model_dump())
+    # Optional on purpose - a provider that answers with a city but no coordinates is
+    # degraded, not useless, and must not be discarded.
+    blank = ObservedEgress()
+    assert blank.lat is None and blank.lon is None
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"loc": "36.1659,-86.7844"}, (36.1659, -86.7844)),
+        ({"loc": "35.9251,-86.8689"}, (35.9251, -86.8689)),
+        # Shapes seen in the wild or trivially producible by a degraded provider.
+        ({"loc": ""}, (None, None)),
+        ({"loc": "36.1659"}, (None, None)),
+        ({"loc": "not,coords"}, (None, None)),
+        ({}, (None, None)),
+    ],
+)
+def test_ipinfo_coordinates_come_out_of_one_packed_string(payload, expected):
+    """ipinfo packs both into `loc`, ip-api uses two numeric fields - which is why the
+    extractor is per provider rather than another key name. A parse failure must yield
+    None rather than a partial or a zero: the consumer treats 0,0 as absent, but only
+    because it was told to, and a 0 here would otherwise read as the Gulf of Guinea."""
+    from app.driver import _coords_from_loc
+
+    assert _coords_from_loc(payload) == expected
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"lat": 36.1659, "lon": -86.7844}, (36.1659, -86.7844)),
+        ({"lat": "35.9251", "lon": "-86.8689"}, (35.9251, -86.8689)),
+        ({"lat": None, "lon": None}, (None, None)),
+        ({"lat": 36.1659}, (None, None)),
+        ({}, (None, None)),
+    ],
+)
+def test_ip_api_coordinates_come_out_of_two_numeric_fields(payload, expected):
+    from app.driver import _coords_from_fields
+
+    assert _coords_from_fields(payload) == expected
+
+
 # --- payload acceptance ---------------------------------------------------------
 
 

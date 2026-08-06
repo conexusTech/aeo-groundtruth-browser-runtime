@@ -117,6 +117,23 @@ class ObservedEgress(BaseModel):
     #: Which IP-geolocation provider answered, so a disagreement between providers is
     #: distinguishable from a genuinely wrong exit.
     source: str | None = None
+    #: Where the provider places that IP. **Added 2026-08-06, and the consumer prefers
+    #: these over `city` when both sides have them.**
+    #:
+    #: A city NAME comparison false-fails a correct session: a residential exit in
+    #: Franklin, TN was reported as "Nashville" by ipinfo (the metro) while ip-api and
+    #: Bright Data's own view both said Franklin. `geo_egress_mismatch` is terminal and
+    #: deliberately not retried, so that discards a correctly-targeted PAID session. It
+    #: was ~1 in 7 exits in sampling — intermittent, which on a quarterly job reads as a
+    #: flaky proxy rather than a units problem.
+    #:
+    #: Distance has no such failure mode: a suburb reported as its metro centre is a few
+    #: km away, while the case the check exists for — Franklin KY, or Franklin OH — is
+    #: hundreds. Populating these is therefore not a diagnostic nicety; it is what lets
+    #: the consumer stop comparing strings. If a provider omits them the consumer falls
+    #: back to the name comparison, so this stays optional.
+    lat: float | None = None
+    lon: float | None = None
 
 
 class InvocationResponse(BaseModel):

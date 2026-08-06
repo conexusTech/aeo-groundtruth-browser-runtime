@@ -56,13 +56,42 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+def _coords_from_loc(payload: dict) -> tuple[float | None, float | None]:
+    """ipinfo returns one `loc: "36.1659,-86.7844"` string rather than two numbers."""
+    parts = str(payload.get("loc") or "").split(",")
+    if len(parts) != 2:
+        return None, None
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        return None, None
+
+
+def _coords_from_fields(payload: dict) -> tuple[float | None, float | None]:
+    """ip-api returns numeric `lat` / `lon` fields."""
+    try:
+        return float(payload["lat"]), float(payload["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None, None
+
+
 #: IP-geolocation endpoints, tried in order. Two providers rather than one because a
 #: single provider cannot distinguish "the proxy exited in the wrong city" from "this
 #: provider's IP database is stale for this range", and those have completely
 #: different fixes. `source` records which answered.
-_EGRESS_PROVIDERS: tuple[tuple[str, str, tuple[str, str, str]], ...] = (
-    ("ipinfo.io", "https://ipinfo.io/json", ("city", "region", "ip")),
-    ("ip-api.com", "http://ip-api.com/json", ("city", "regionName", "query")),
+#:
+#: Each also yields COORDINATES, which the consumer prefers over the city name — see
+#: `ObservedEgress.lat`. They arrive in different shapes (ipinfo packs both into one
+#: `loc` string; ip-api uses two numeric fields), so the extractor is per provider
+#: rather than another key name.
+_EGRESS_PROVIDERS: tuple[tuple[str, str, tuple[str, str, str], Any], ...] = (
+    ("ipinfo.io", "https://ipinfo.io/json", ("city", "region", "ip"), _coords_from_loc),
+    (
+        "ip-api.com",
+        "http://ip-api.com/json",
+        ("city", "regionName", "query"),
+        _coords_from_fields,
+    ),
 )
 
 #: Hard ceiling on the browser session itself, independent of our own deadline. The
@@ -209,7 +238,7 @@ async def _read_egress(page: Page, deadline: _Deadline) -> ObservedEgress | None
     Returns None only when every provider failed, which the consumer treats as a
     mismatch — unverifiable geography is not a result.
     """
-    for name, url, (city_key, region_key, ip_key) in _EGRESS_PROVIDERS:
+    for name, url, (city_key, region_key, ip_key), coords in _EGRESS_PROVIDERS:
         try:
             response = await page.goto(
                 url,
@@ -230,12 +259,20 @@ async def _read_egress(page: Page, deadline: _Deadline) -> ObservedEgress | None
             # before concluding anything.
             logger.warning("egress provider %s failed: %s", name, exc)
             continue
+        lat, lon = coords(payload)
         egress = ObservedEgress(
             city=payload.get(city_key),
             region=payload.get(region_key),
             ip=payload.get(ip_key),
             source=name,
+            lat=lat,
+            lon=lon,
         )
+        # Still keyed on `city`, not on coordinates. A provider that answers with a city
+        # and no `loc` is degraded, not useless — the consumer falls back to comparing
+        # names — whereas one with neither told us nothing. Requiring coordinates here
+        # would turn a partial answer into "every provider failed", which the consumer
+        # reads as a terminal mismatch.
         if egress.city:
             return egress
         logger.warning("egress provider %s answered without a city", name)

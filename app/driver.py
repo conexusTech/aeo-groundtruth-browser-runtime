@@ -113,10 +113,22 @@ _STREAM_APPEAR_TIMEOUT_MS = 15_000
 _INPUT_TIMEOUT_MS = 30_000
 #: Ceiling on the text-stability fallback specifically, separate from the invocation
 #: deadline. The deadline is the whole budget; spending all of it on the weakest completion
-#: signal is what a live run did (164s, no answer). An answer that has not settled in 45s
-#: is not going to — and this must stay comfortably under `timeout_seconds` (90s) or the
-#: deadline fires first and the cap never has an effect.
-_STABILITY_MAX_MS = 45_000
+#: signal is what a live run did (164s, no answer). This must stay comfortably under
+#: `timeout_seconds` (90s) or the deadline fires first and the cap never has an effect.
+#:
+#: **Raised 45s → 65s on 2026-08-06, from measurement rather than feel.** The first real
+#: ground-truth run failed 6 of 8 chatgpt.com jobs as `extraction_failed`, each logging
+#: `elapsed_s≈59` — i.e. ~14s of egress/navigation/input overhead plus the 45s cap,
+#: exactly. perplexity.ai failed none: its answers average ~630 characters and settle
+#: quickly, while chatgpt.com runs a web search and renders a `businesses-map-widget`
+#: before its ~2,700-character answer appears.
+#:
+#: 90s budget − ~14s overhead leaves ~76s, so 65 keeps ~11s of margin. **The durable fix
+#: is a real streaming indicator for chatgpt.com** — completion would then be observed
+#: rather than inferred — but `--discover` only dumps after the answer has settled, so
+#: the stop control is gone before anything can see it. Verifying one needs a mid-stream
+#: dump, which the runtime cannot currently take.
+_STABILITY_MAX_MS = 65_000
 #: Per selector class in a discovery dump. Enough to see the shape of the page without
 #: turning `a[href^='http']` into a megabyte of envelope.
 _DISCOVERY_SAMPLE_LIMIT = 25

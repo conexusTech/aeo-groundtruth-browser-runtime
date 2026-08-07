@@ -789,57 +789,34 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     assert result.challenge is False
 
 
-def test_the_surface_is_allowed_to_settle_before_the_prompt_is_submitted(monkeypatch):
-    """🔴 The race that best explains chatgpt.com's ~60% wall rate (2026-08-06).
+def test_the_device_identity_is_already_present_when_we_submit(monkeypatch):
+    """🪦 The autopsy of the "we submit too early" hypothesis, kept so nobody re-derives it.
 
-    The wall lands at `auth.openai.com` only AFTER submit, never on load, and the same
-    fingerprint and IP succeed at other times. chatgpt.com establishes a device identity
-    (`oai-did`, echoed as an `oai-device-id` header) via an XHR on first visit. We navigate
-    with `wait_until='domcontentloaded'` — which fires before that lands — and the composer
-    renders early too, so submitting the moment it appears sends the message with no
-    established identity.
+    The theory: chatgpt.com walls us because we press Enter before its device identity
+    (`oai-did`, echoed as an `oai-device-id` header) exists — we navigate on
+    `domcontentloaded`, which fires before that XHR lands, and the composer renders early
+    too. It fit everything: intermittency, identical fingerprints on both outcomes, the
+    wall landing only after submit, perplexity unaffected, and a residential proxy losing
+    a race more often than a datacentre egress.
 
-    A race is the only shape that fits: a static block would be 100%, and quota would not
-    reset when every session is a fresh browser with a fresh device and therefore a fresh
-    anonymous allowance.
+    It was wrong. Two live sessions reported `oai-did` already present at load, and the
+    cookie list byte-identical before and after a `networkidle` wait. That wait was
+    REMOVED — chatgpt.com long-polls so it never idles, and it burned its full 8s on every
+    job to change nothing.
 
-    Both sides of the wait are recorded so this stays falsifiable — if the cookie lists
-    match, nothing was in flight and the hypothesis is dead.
+    What survives is this: the cookie state at submit is recorded, so the claim "the
+    surface was ready" stays evidence rather than memory.
     """
     monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
     page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
-    # Budget well above the stepping clock: at 5s per READ the 8s default expires
-    # while `remaining_ms` is being evaluated, so the settle is never reached.
+    page._cookies = [{"name": "oai-did"}, {"name": "__cf_bm"}]
     result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
 
-    assert "networkidle" in page.load_states, "the prompt was submitted without waiting"
-    assert result.trace["settled"] is True
-    assert result.trace["cookies_on_load"] != result.trace["cookies_at_submit"], (
-        "the wait changed nothing, so the race hypothesis has no support"
+    assert result.trace["cookies_at_submit"] == ["__cf_bm", "oai-did"]
+    assert page.load_states == [], (
+        "the removed networkidle wait is back; chatgpt.com never idles, so it costs its "
+        "whole budget on every job and changes nothing"
     )
-    assert "oai-did" in result.trace["cookies_at_submit"]
-
-
-def test_the_settle_wait_never_fails_a_run_on_a_surface_that_never_idles(monkeypatch):
-    """Long-polling and telemetry beacons mean some surfaces never reach networkidle.
-
-    That is normal, and it must cost the timeout and nothing more — turning it into a
-    failure would trade a measurable answer for none on every such surface.
-    """
-    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
-    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
-
-    async def never_idles(state, timeout=None):
-        page.load_states.append(state)
-        raise FakeTimeout("never idle")
-
-    page.wait_for_load_state = never_idles
-    # Budget well above the stepping clock: at 5s per READ the 8s default expires
-    # while `remaining_ms` is being evaluated, so the settle is never reached.
-    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
-
-    assert result.trace["settled"] == "timeout"
-    assert result.trace["step"] != "enter_prompt", "the run stopped instead of proceeding"
 
 
 def test_cookie_names_are_recorded_but_never_their_values(monkeypatch):
@@ -853,7 +830,7 @@ def test_cookie_names_are_recorded_but_never_their_values(monkeypatch):
     result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
 
     assert "SECRET-DEVICE-TOKEN" not in json.dumps(result.trace)
-    assert "oai-did" in result.trace["cookies_on_load"]
+    assert "oai-did" in result.trace["cookies_at_submit"]
 
 
 def test_the_self_identifying_user_agent_is_replaced_before_anything_navigates(monkeypatch):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -182,6 +183,21 @@ class FakePage:
         self.evaluated = 0
         self.fingerprint_probes = 0
         self.discovery_dumps = 0
+        self.load_states: list[str] = []
+        #: Cookie names by the time each read happens. The surface sets its device
+        #: identity via an XHR that lands AFTER `domcontentloaded`, so the fake grows a
+        #: cookie once the driver has waited - which is the whole behaviour under test.
+        self._cookies = [{"name": "__Host-next-auth.csrf-token"}]
+        self.context = SimpleNamespace(cookies=self._read_cookies)
+
+    async def _read_cookies(self):
+        return list(self._cookies)
+
+    async def wait_for_load_state(self, state, timeout=None):
+        self.load_states.append(state)
+        if state == "networkidle":
+            # The bootstrap completes only once something actually waits for it.
+            self._cookies = self._cookies + [{"name": "oai-did"}]
 
     def locator(self, selector):
         return FakeLocator(self.dom.get(selector, []))
@@ -771,6 +787,73 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     # someone else closing it, so the consumer must be free to retry.
     assert result.login_wall is False
     assert result.challenge is False
+
+
+def test_the_surface_is_allowed_to_settle_before_the_prompt_is_submitted(monkeypatch):
+    """🔴 The race that best explains chatgpt.com's ~60% wall rate (2026-08-06).
+
+    The wall lands at `auth.openai.com` only AFTER submit, never on load, and the same
+    fingerprint and IP succeed at other times. chatgpt.com establishes a device identity
+    (`oai-did`, echoed as an `oai-device-id` header) via an XHR on first visit. We navigate
+    with `wait_until='domcontentloaded'` — which fires before that lands — and the composer
+    renders early too, so submitting the moment it appears sends the message with no
+    established identity.
+
+    A race is the only shape that fits: a static block would be 100%, and quota would not
+    reset when every session is a fresh browser with a fresh device and therefore a fresh
+    anonymous allowance.
+
+    Both sides of the wait are recorded so this stays falsifiable — if the cookie lists
+    match, nothing was in flight and the hypothesis is dead.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+    # Budget well above the stepping clock: at 5s per READ the 8s default expires
+    # while `remaining_ms` is being evaluated, so the settle is never reached.
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert "networkidle" in page.load_states, "the prompt was submitted without waiting"
+    assert result.trace["settled"] is True
+    assert result.trace["cookies_on_load"] != result.trace["cookies_at_submit"], (
+        "the wait changed nothing, so the race hypothesis has no support"
+    )
+    assert "oai-did" in result.trace["cookies_at_submit"]
+
+
+def test_the_settle_wait_never_fails_a_run_on_a_surface_that_never_idles(monkeypatch):
+    """Long-polling and telemetry beacons mean some surfaces never reach networkidle.
+
+    That is normal, and it must cost the timeout and nothing more — turning it into a
+    failure would trade a measurable answer for none on every such surface.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+
+    async def never_idles(state, timeout=None):
+        page.load_states.append(state)
+        raise FakeTimeout("never idle")
+
+    page.wait_for_load_state = never_idles
+    # Budget well above the stepping clock: at 5s per READ the 8s default expires
+    # while `remaining_ms` is being evaluated, so the settle is never reached.
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.trace["settled"] == "timeout"
+    assert result.trace["step"] != "enter_prompt", "the run stopped instead of proceeding"
+
+
+def test_cookie_names_are_recorded_but_never_their_values(monkeypatch):
+    """`trace` is persisted to `sov_results.raw_response` as jsonb by the consumer, and a
+    session cookie is a credential. Names diagnose the race; values would be a leak."""
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage({"#composer": [FakeNode(visible=True, value="")]})
+    page._cookies = [{"name": "oai-did", "value": "SECRET-DEVICE-TOKEN"}]
+    # Budget well above the stepping clock: at 5s per READ the 8s default expires
+    # while `remaining_ms` is being evaluated, so the settle is never reached.
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert "SECRET-DEVICE-TOKEN" not in json.dumps(result.trace)
+    assert "oai-did" in result.trace["cookies_on_load"]
 
 
 def test_the_self_identifying_user_agent_is_replaced_before_anything_navigates(monkeypatch):

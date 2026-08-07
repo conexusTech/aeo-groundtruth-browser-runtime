@@ -865,6 +865,61 @@ _CONSUMER_UA = (
 )
 
 
+#: How long to let the surface finish bootstrapping before the prompt is submitted.
+#:
+#: 🔴 The hypothesis this tests (2026-08-06). chatgpt.com walls ~60% of our sessions at
+#: `auth.openai.com` — but only AFTER the prompt is submitted, never on load, and the
+#: identical fingerprint and IP succeed at other times. Research on the surface says it
+#: creates a persistent device identifier (`oai-did`, echoed as an `oai-device-id` header)
+#: on first visit, used for abuse monitoring, and that a session without its necessary
+#: cookies cannot be maintained.
+#:
+#: We navigate with `wait_until="domcontentloaded"`, which fires BEFORE that bootstrap XHR
+#: lands, then submit the moment the composer is visible — and the composer renders early
+#: too. Submitting into that gap sends the message with no established identity.
+#:
+#: That is a RACE, which is the only shape that explains intermittency: a static block
+#: would be 100%, and a quota would not reset (every session is a fresh browser, so a fresh
+#: device, so a fresh anonymous allowance — which is also why quota exhaustion is NOT the
+#: explanation). A residential proxy adds latency and jitter, so we lose the race more
+#: often than a datacentre egress would.
+#:
+#: ⚠️ Deliberately generic — `wait_for_load_state("networkidle")`, not a poll for a cookie
+#: named `oai-did`. This runtime drives whatever surface it is told to (Option A), and
+#: hard-coding one vendor's cookie name would put surface-specific knowledge in the
+#: generic driver. The cookie NAMES are recorded instead, so the diagnosis stays readable
+#: without the code needing to know them.
+_SETTLE_TIMEOUT_MS = 8_000
+
+
+async def _record_cookie_state(page: Page, trace: dict, label: str) -> None:
+    """Record which cookies exist at a moment. Diagnostic only, never fails the run.
+
+    Names only — never values. A session cookie is a credential, and `trace` is persisted
+    to `sov_results.raw_response` as jsonb by the consumer.
+    """
+    try:
+        names = sorted({c["name"] for c in await page.context.cookies()})
+        trace[f"cookies_{label}"] = names[:20]
+    except Exception as exc:  # noqa: BLE001
+        trace[f"cookies_{label}"] = f"unreadable: {type(exc).__name__}"
+
+
+async def _settle_before_submit(page: Page, deadline: _Deadline, trace: dict) -> None:
+    """Let in-flight requests finish before the prompt is sent. See `_SETTLE_TIMEOUT_MS`."""
+    try:
+        await page.wait_for_load_state(
+            "networkidle", timeout=deadline.remaining_ms(_SETTLE_TIMEOUT_MS)
+        )
+        trace["settled"] = True
+    except DeadlineExceeded:
+        raise
+    except Exception:  # noqa: BLE001
+        # A surface that never goes idle (long-polling, telemetry beacons) is normal and
+        # must not fail the run — we simply proceed as before.
+        trace["settled"] = "timeout"
+
+
 async def _mask_user_agent(context, page: Page, trace: dict) -> None:
     """Replace the self-identifying UA, on the header as well as on `navigator`.
 
@@ -1093,6 +1148,12 @@ async def _drive(
     # question", and the only honest test for that is to try to ask it.
     state.step("enter_prompt")
     trace["url_at_submit"] = (await _page_state(page))[0]
+    # Both sides of the settle are recorded. If the two lists differ, the wait is doing
+    # real work and the surface genuinely was not ready when we used to submit; if they
+    # are identical, the race hypothesis is dead and this should come back out.
+    await _record_cookie_state(page, trace, "on_load")
+    await _settle_before_submit(page, deadline, trace)
+    await _record_cookie_state(page, trace, "at_submit")
     try:
         await _enter_prompt(page, sel, req.prompt, deadline, trace, discover=req.discover)
     except DeadlineExceeded:

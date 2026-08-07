@@ -962,6 +962,46 @@ def _is_page_gone(exc: Exception) -> bool:
     return any(marker in text for marker in _PAGE_GONE_MARKERS)
 
 
+#: Reads an element's text with `sel.exclude` subtrees removed first.
+#:
+#: Operates on a CLONE — `cloneNode(true)` — so the live page is never mutated. Mutating
+#: it would be a real hazard on this path: the stability loop reads the same node every
+#: 1.5s, and a destructive read would shrink the text on the first poll and then report it
+#: as "settled".
+_TEXT_WITHOUT_JS = """
+([selector, exclude]) => {
+  const nodes = document.querySelectorAll(selector);
+  if (!nodes.length) return '';
+  const el = nodes[nodes.length - 1].cloneNode(true);   // LAST match, as the driver does
+  for (const ex of exclude) {
+    try { el.querySelectorAll(ex).forEach((n) => n.remove()); } catch (e) {}
+  }
+  return (el.innerText || el.textContent || '').trim();
+}
+"""
+
+#: Hrefs under the citation selectors, skipping anything inside an excluded subtree.
+_LINKS_WITHOUT_JS = """
+([selectors, exclude]) => {
+  const out = [];
+  for (const sel of selectors) {
+    let nodes;
+    try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
+    for (const a of nodes) {
+      // `closest` is the whole point: the anchor itself looks perfectly ordinary, and
+      // only its ANCESTRY says it belongs to page furniture rather than to the answer.
+      const inside = exclude.some((ex) => { try { return !!a.closest(ex); } catch (e) { return false; } });
+      if (inside) continue;
+      const href = a.getAttribute('href');
+      if (!href || href.startsWith('javascript:')) continue;
+      out.push({ url: href, title: (a.innerText || '').trim() || null });
+    }
+  }
+  return out;
+}
+"""
+
+
 async def _read_answer(page: Page, sel: Selectors) -> str:
     """Read the answer text.
 
@@ -971,6 +1011,13 @@ async def _read_answer(page: Page, sel: Selectors) -> str:
     the answer.
     """
     try:
+        if sel.exclude:
+            # Text with the furniture subtrees stripped. Done in the page rather than by
+            # post-processing the string, because once the widget's text is concatenated
+            # into the answer there is no reliable way to tell it apart from prose.
+            return str(
+                await page.evaluate(_TEXT_WITHOUT_JS, [sel.answer, sel.exclude])
+            ).strip()
         nodes = page.locator(sel.answer)
         count = await nodes.count()
         if count == 0:
@@ -987,6 +1034,23 @@ async def _read_answer(page: Page, sel: Selectors) -> str:
 
 async def _read_citations(page: Page, sel: Selectors) -> list[Citation]:
     found: dict[str, Citation] = {}
+    if sel.exclude:
+        # One evaluate rather than a locator walk, because the test is ANCESTRY: the
+        # anchor itself is indistinguishable from a real citation, and only `closest()`
+        # can say it sits inside page furniture. Live data had `mapbox.com` (20) and
+        # `openstreetmap.org` (10) — 24% of every citation captured — recorded as sources
+        # the AI cited, purely because chatgpt's map widget lives inside the answer turn.
+        try:
+            for link in await page.evaluate(
+                _LINKS_WITHOUT_JS, [list(sel.citation), sel.exclude]
+            ):
+                found.setdefault(
+                    link["url"], Citation(url=link["url"], title=link.get("title"))
+                )
+            return list(found.values())
+        except Exception as exc:  # noqa: BLE001
+            # Fall through to the locator path rather than losing every citation.
+            logger.warning("scoped citation read failed, falling back: %s", exc)
     for selector in sel.citation:
         try:
             links = page.locator(selector)

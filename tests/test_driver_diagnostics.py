@@ -38,12 +38,21 @@ class FakeTimeout(Exception):
 
 
 class FakeNode:
-    def __init__(self, *, visible=True, text="", value=None, enabled=True):
+    def __init__(self, *, visible=True, text="", value=None, enabled=True,
+                 href=None, furniture=False, text_without_furniture=None):
         self.visible = visible
         self.text = text
         self.value = value
         self.enabled = enabled
         self.clicked = False
+        #: For citation nodes.
+        self.href = href
+        #: True when this node sits inside a `sel.exclude` subtree - chatgpt's business
+        #: map widget renders INSIDE the assistant turn, so the anchor looks like a real
+        #: citation and only its ancestry says otherwise.
+        self.furniture = furniture
+        #: What the answer reads to once the excluded subtrees are stripped.
+        self.text_without_furniture = text_without_furniture
 
 
 class _TransientNode(FakeNode):
@@ -138,6 +147,13 @@ class FakeLocator:
     async def inner_text(self, timeout=None):
         return self._one().text
 
+    async def get_attribute(self, name, timeout=None):
+        # Added 2026-08-07. Its absence meant `_read_citations`' locator path raised
+        # AttributeError on every call, was swallowed by that function's own
+        # never-fail-a-run handler, and returned zero citations — so the ORIGINAL
+        # citation reader had never once been exercised by a test.
+        return getattr(self._one(), name, None)
+
     async def input_value(self, timeout=None):
         node = self._one()
         if node.value is None:
@@ -225,6 +241,25 @@ class FakePage:
         # test still passed. A fake that cannot express the call the implementation makes
         # cannot falsify it.
         self.evaluated += 1
+        if "cloneNode" in script:                       # _TEXT_WITHOUT_JS
+            selector, exclude = args
+            nodes = self.dom.get(selector, [])
+            if not nodes:
+                return ""
+            n = nodes[-1]
+            if exclude and n.text_without_furniture is not None:
+                return n.text_without_furniture
+            return n.text
+        if "closest" in script:                          # _LINKS_WITHOUT_JS
+            selectors, exclude = args
+            out = []
+            for sel_ in selectors:
+                for n in self.dom.get(sel_, []):
+                    if exclude and n.furniture:
+                        continue
+                    if n.href:
+                        out.append({"url": n.href, "title": n.text or None})
+            return out
         if args is None:
             self.fingerprint_probes += 1
             # Stand in for a headless browser: the markers the stealth script targets.
@@ -787,6 +822,74 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     # someone else closing it, so the consumer must be free to retry.
     assert result.login_wall is False
     assert result.challenge is False
+
+
+def test_page_furniture_inside_the_answer_is_excluded_from_text_and_citations(monkeypatch):
+    """🔴 Measured from live ground-truth data (2026-08-07).
+
+    chatgpt.com renders `<div data-testid='businesses-map-widget'>` INSIDE the assistant
+    turn. Both the answer selector and the citation selector are correctly scoped to that
+    turn, so both swallowed it, and the consequences reached the customer:
+
+      * answers arrived as a directory dump — star ratings, "Closed", "Give feedback" —
+        rather than prose, and that is the text the extractor classifies entities from;
+      * `mapbox.com` (20) and `openstreetmap.org` (10) were stored as CITATIONS, 24% of
+        every citation captured, i.e. map attribution recorded as "the AI cited this".
+
+    An anchor inside the widget is indistinguishable from a real citation on its own —
+    only its ANCESTRY says otherwise — which is why the fix tests `closest()` rather than
+    denylisting hostnames.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode(visible=False)],
+            "#answer": [
+                FakeNode(
+                    text="Franklin Roof Co is well reviewed. Superior Roofing 3.7 Closed",
+                    text_without_furniture="Franklin Roof Co is well reviewed.",
+                )
+            ],
+            "#cite": [
+                FakeNode(text="franklinroofco", href="https://franklinroofco.com/"),
+                FakeNode(text="Mapbox", href="https://mapbox.com/about/maps",
+                         furniture=True),
+                FakeNode(text="OpenStreetMap", href="https://openstreetmap.org/",
+                         furniture=True),
+            ],
+        }
+    )
+    req = _request({}, timeout_seconds=400.0)
+    req.selectors.exclude = ["[data-testid='businesses-map-widget']"]
+    result = _run(req, page, monkeypatch)
+
+    assert result.answer_text == "Franklin Roof Co is well reviewed.", (
+        "the map widget's ratings and hours are still being read as the answer"
+    )
+    hosts = {c.url for c in result.citations}
+    assert hosts == {"https://franklinroofco.com/"}, (
+        f"map attribution is still stored as a citation: {hosts}"
+    )
+
+
+def test_without_an_exclude_list_reading_is_unchanged(monkeypatch):
+    """The non-regression half. perplexity.ai has no furniture to strip, so it must keep
+    taking the plain locator path — a surface that sets no `exclude` must not silently
+    change behaviour."""
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = FakePage(
+        {
+            "#composer": [FakeNode(visible=True, value="")],
+            "#streaming": [FakeNode(visible=False)],
+            "#answer": [FakeNode(text="Quality Exteriors is a long-standing contractor.")],
+            "#cite": [FakeNode(text="qualityexteriors", href="https://qualityexteriors.com/")],
+        }
+    )
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.answer_text == "Quality Exteriors is a long-standing contractor."
+    assert [c.url for c in result.citations] == ["https://qualityexteriors.com/"]
 
 
 def test_the_device_identity_is_already_present_when_we_submit(monkeypatch):

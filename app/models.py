@@ -55,6 +55,22 @@ class Selectors(BaseModel):
     login_wall: list[str] = Field(default_factory=list)
     challenge: list[str] = Field(default_factory=list)
     citation: list[str] = Field(default_factory=list)
+    #: Subtrees to strip from the answer BEFORE its text and its links are read.
+    #:
+    #: 🔴 Measured need (2026-08-07). chatgpt.com renders
+    #: `<div data-testid='businesses-map-widget'>` INSIDE the assistant turn, so both the
+    #: answer selector and the citation selector — correctly scoped to that turn — swallow
+    #: it. In live ground-truth data that produced:
+    #:
+    #:   * answers arriving as a directory dump (star ratings, "Closed", "Give feedback")
+    #:     instead of prose, which is what the extractor then has to classify from; and
+    #:   * `mapbox.com` (20) and `openstreetmap.org` (10) stored as CITATIONS — 24% of
+    #:     every citation captured — i.e. map attribution recorded as "the AI cited this".
+    #:
+    #: Excluding the subtree fixes both at source. Doing it here rather than denylisting
+    #: hostnames downstream keeps it a statement about the PAGE, which is what it is: the
+    #: widget is not part of the assistant's answer, whatever it happens to link to.
+    exclude: list[str] = Field(default_factory=list)
 
 
 class InvocationRequest(BaseModel):

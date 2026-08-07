@@ -37,33 +37,67 @@ from botocore.config import Config as BotoConfig
 
 REGION = "us-east-1"
 
-# The placeholder selectors from aeo-agent-service, with the PLACEHOLDER prefix
-# stripped. They are a starting guess only - confirming or replacing them is the point.
+# 🪞 A MIRROR of `aeo-agent-service/app/adapters/sov/_browser_surfaces.py`, synced
+# 2026-08-07. That module is the source of truth — it holds the `SELECTORS_VERIFIED` gate
+# and the tests that enforce it — and this repo cannot import from it.
+#
+# 🔴 Why this block was rewritten. It still carried the original PLACEHOLDER guesses, and
+# every one of them had since been DISPROVED by live discovery runs:
+#
+#   `#prompt-textarea`            matched nothing - the identifier is `name`, not `id`
+#   `[data-testid='send-button']` does not exist until the composer has text
+#   `[data-testid='login-button']` is permanent header chrome, NOT a wall
+#   `[class*='prose']`            matched 4 elements incl. list items, and the driver
+#                                 reads the LAST - returning one bullet as the answer
+#   `textarea[placeholder]`       perplexity's composer is a contenteditable div
+#
+# So without `--discover` this script was testing selectors production had abandoned,
+# which makes it worse than no tool: it would "confirm" a surface works using selectors
+# the real adapter does not use, or fail on ones nobody ships.
+#
+# ⚠️ When `_browser_surfaces.py` changes, change this too. There is no test that can
+# catch the drift from inside this repo — the check is the sync date above.
 SURFACES = {
     "chatgpt.com": {
         "url": "https://chatgpt.com/",
         "selectors": {
-            "input": "#prompt-textarea",
-            "submit": "[data-testid='send-button']",
+            "input": "textarea[name='prompt-textarea'], #prompt-textarea[contenteditable='true']",
+            # None: the send button only exists once the composer has text, so no dump can
+            # catch it. The runtime presses Enter and records `submit_method`.
+            "submit": None,
             "answer": "[data-message-author-role='assistant']",
-            "streaming": "[data-testid='stop-button']",
-            "consent": ["[data-testid='cookie-accept']"],
-            "login_wall": ["[data-testid='login-button']"],
-            "challenge": ["#challenge-form"],
-            "citation": ["a[data-citation]"],
+            # None on both surfaces: no streaming indicator has ever been observed, and a
+            # selector that never appears costs its whole appear-timeout on every run.
+            "streaming": None,
+            # Verified ABSENT from a US residential exit, which is the only geography
+            # Tier 3 targets.
+            "consent": [],
+            "login_wall": [],
+            "challenge": [],
+            "citation": ["[data-message-author-role='assistant'] a[href^='http']"],
+            # The businesses map renders INSIDE the assistant turn, so without this the
+            # answer arrives as a directory dump and mapbox/openstreetmap are captured as
+            # citations (24% of all of them, measured).
+            "exclude": [
+                "[data-testid='businesses-map-widget']",
+                "[class*='mapboxgl-ctrl']",
+            ],
         },
     },
     "perplexity.ai": {
         "url": "https://www.perplexity.ai/",
         "selectors": {
-            "input": "textarea[placeholder]",
+            "input": "#ask-input[contenteditable='true'], [role='textbox'][contenteditable='true']",
             "submit": "button[aria-label='Submit']",
-            "answer": "[class*='prose']",
-            "streaming": "[class*='animate-pulse']",
-            "consent": ["button:has-text('Accept')"],
-            "login_wall": ["[data-testid='signin-modal']"],
-            "challenge": ["#cf-challenge"],
-            "citation": ["a[class*='citation']"],
+            # `div.prose` matches the class TOKEN, so `prose-p:pt-0` on the nested list
+            # items is excluded by construction rather than by luck.
+            "answer": "div.prose",
+            "streaming": None,
+            "consent": [],
+            "login_wall": [],
+            "challenge": [],
+            "citation": ["a[href^='http']"],
+            "exclude": [],
         },
     },
 }

@@ -662,10 +662,35 @@ async def _await_completion(
     # that argument applies to the settle loop below, and applying it here is what
     # cancelled a perplexity answer the session had already paid for.
     trace["completion"] = "answer_never_appeared"
+    # The host we submitted from. A move AWAY from it means the answer is never going to
+    # render here, however long we wait.
+    submit_host = urlsplit(str(trace.get("url_at_submit") or "")).hostname or ""
     current = len(await _read_answer(page, sel))
     samples.append(current)
     while current == 0:
         if deadline.expired:
+            _record()
+            return
+        # 🔴 Why this check exists, and why it is a HOST comparison.
+        #
+        # A walled chatgpt.com session is bounced to `auth.openai.com` the moment it
+        # submits — and then this loop polled that page, which can never grow an answer,
+        # for the entire remaining budget. Measured at `elapsed_s=92.54` against ~83s
+        # before the appear/settle split, i.e. ~60s of PAID browser per walled job spent
+        # on a page already known to be a dead end.
+        #
+        # It also gives `url_at_completion` its first consumer. The field was recorded
+        # here for exactly this purpose and `_await_completion`'s own comment claimed
+        # "the caller compares it against where the prompt was submitted from" — but
+        # nothing in either repo ever read it.
+        #
+        # ⚠️ HOST, never the full URL. chatgpt.com navigates `/` → `/c/<id>` on a
+        # SUCCESSFUL submit, so comparing URLs would abort every healthy run — the exact
+        # trap `_classify_blocked_page`'s critical-negative test was written to guard.
+        current_host = urlsplit(page.url).hostname or ""
+        if submit_host and current_host and current_host != submit_host:
+            trace["completion"] = "navigated_away"
+            trace["url_at_completion"] = page.url
             _record()
             return
         await asyncio.sleep(1.5)

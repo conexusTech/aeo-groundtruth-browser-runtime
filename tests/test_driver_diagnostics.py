@@ -824,6 +824,71 @@ def test_a_closed_browser_stops_polling_instead_of_burning_the_budget(monkeypatc
     assert result.challenge is False
 
 
+def test_a_session_bounced_off_the_host_stops_polling_immediately(monkeypatch):
+    """🔴 ~60s of PAID browser per walled job, spent on a page that can never answer.
+
+    A walled chatgpt.com session is redirected to `auth.openai.com` the instant it
+    submits, and the appear loop then polled that page for the whole remaining budget —
+    measured at `elapsed_s=92.54`, against ~83s before appearing was un-capped.
+
+    This is also `url_at_completion`'s first consumer. The field was recorded for exactly
+    this comparison, and `_await_completion`'s own comment claimed the caller made it,
+    but nothing in either repo ever read it.
+    """
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = _bounced_page("https://auth.openai.com/log-in-or-create-account", "Log in")
+    # No streaming indicator, which is PRODUCTION: `streaming_selector` is None on both
+    # chatgpt.com and perplexity.ai, so every real run takes the text fallback. The shared
+    # fixture's `_TransientNode` would exit via the fast path and never reach the loop
+    # this test is about.
+    page.dom["#streaming"] = [FakeNode(visible=False)]
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.trace["completion"] == "navigated_away", (
+        "still polling a page the session was bounced off"
+    )
+    assert result.trace["url_at_completion"].startswith("https://auth.openai.com/")
+    # The point of the fix: it gave up early rather than burning the budget.
+    assert len(result.trace["stability_samples"]) <= 3, (
+        f"polled {len(result.trace['stability_samples'])}x after leaving the surface"
+    )
+
+
+def test_a_successful_navigation_to_the_conversation_url_keeps_polling(monkeypatch):
+    """THE critical negative. chatgpt.com navigates `/` → `/c/<id>` on a SUCCESSFUL
+    submit, so comparing full URLs instead of HOSTS would abort every healthy run and
+    report a wall on the exact path that worked."""
+    monkeypatch.setattr(driver.time, "monotonic", _SteppingClock(5.0))
+    page = _bounced_page("https://chatgpt.com/c/abc123", "ChatGPT")
+    page.dom["#streaming"] = [FakeNode(visible=False)]
+
+    # ⚠️ The answer must arrive LATE, and that is the whole point of this test. With it
+    # present on the first read the appear loop never runs, the host comparison is never
+    # reached, and a mutation swapping HOST for full-URL survived — the test could not
+    # fail for the reason it exists.
+    answer = "Franklin Roof Co is well reviewed."
+    reads = {"n": 0}
+
+    class LateLocator(FakeLocator):
+        async def inner_text(self, timeout=None):
+            reads["n"] += 1
+            return answer if reads["n"] > 3 else ""
+
+    original = page.locator
+    page.locator = lambda s: (
+        LateLocator([FakeNode(text="")]) if s == "#answer" else original(s)
+    )
+    result = _run(_request({}, timeout_seconds=400.0), page, monkeypatch)
+
+    assert result.answer_text == answer, (
+        "a same-host navigation to the conversation URL aborted a healthy run"
+    )
+    assert result.trace["completion"] != "navigated_away"
+    assert result.trace["answer_appeared_after_polls"] > 1, (
+        "the answer was present immediately, so the host comparison never ran"
+    )
+
+
 def test_page_furniture_inside_the_answer_is_excluded_from_text_and_citations(monkeypatch):
     """🔴 Measured from live ground-truth data (2026-08-07).
 

@@ -458,3 +458,82 @@ Set in `aeo-agent-service/.env` (already done):
 AGENTCORE_BROWSER_RUNTIME_ARN=arn:aws:bedrock-agentcore:us-east-1:082585646836:runtime/aeo_groundtruth_browser-fGhiSo82t0
 AGENTCORE_REGION=us-east-1
 ```
+
+---
+
+## AWS resource hygiene (audited 2026-08-07)
+
+Run this audit after any burst of redeploys. Every `update-agent-runtime` pushes a new
+125 MB image AND creates a runtime version, and **only one of those two can ever be
+cleaned up**.
+
+### What is NOT litter, despite appearances
+
+**Runtime versions accumulate permanently and that is by design.** There is no
+`delete-agent-runtime-version` — the API offers only `delete-agent-runtime` (the whole
+runtime) and `delete-agent-runtime-endpoint`. Every runtime in this account behaves the
+same way, and ours has the fewest:
+
+| runtime | versions |
+|---|---|
+| `aeoskills_aeo_hello_world` | 15 |
+| `aeoskills_aeo_av_lead_scanner` | 15 |
+| `aeo_groundtruth_browser` | 14 |
+
+Each version pins the image it was built from, so those images are *referenced*, not
+orphaned. Verify before deleting anything — map digests to versions rather than assuming
+that an old tag is dead:
+
+```powershell
+aws bedrock-agentcore-control list-agent-runtime-versions --agent-runtime-id <id> --region us-east-1
+aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id <id> --agent-runtime-version <n> `
+  --region us-east-1 --query "agentRuntimeArtifact.containerConfiguration.containerUri"
+```
+
+At the 2026-08-07 audit, 14 of 15 images were referenced by a version. Exactly one —
+`4545e06`, pushed before the first runtime existed — was genuinely orphaned.
+
+### 🛑 We are OUT OF LINE with the account convention on one thing
+
+Both sibling ECR repos carry a lifecycle policy and ours does not, which is why ours holds
+**15 images / 1,872 MB** against their 10 / ~800 MB:
+
+```json
+{"rules":[{"rulePriority":1,"description":"Keep last 10 images",
+  "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+  "action":{"type":"expire"}}]}
+```
+
+**Needs an administrator — `ecr:PutLifecyclePolicy` and `ecr:BatchDeleteImage` are both
+denied to `leo.lindo`**, even inside the granted `aeo-groundtruth/*` namespace. The ask is
+exactly two things:
+
+1. Apply the policy above to `aeo-groundtruth/browser`.
+2. Delete the orphaned image tag `4545e06`.
+
+⚠️ Expiring to 10 images strands the oldest runtime versions — their images disappear and
+they can no longer be rolled back to. That is already true of the sibling runtimes (15
+versions, 10 images), so it is the accepted trade in this account, not a new risk.
+
+### Log retention
+
+`/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` is created with **no expiry**. There is no
+account convention (the siblings sit at `3` days and unset, one having accumulated 25 MB),
+so ours is set to 30:
+
+```powershell
+aws logs put-retention-policy --region us-east-1 `
+  --log-group-name /aws/bedrock-agentcore/runtimes/aeo_groundtruth_browser-fGhiSo82t0-DEFAULT `
+  --retention-in-days 30
+```
+
+⚠️ From Git Bash this fails with a regex complaint about `logGroupName` — that is MSYS
+rewriting the leading `/` into a Windows path, not an API error. Use PowerShell, or prefix
+with `MSYS_NO_PATHCONV=1`.
+
+### Clean at the 2026-08-07 audit
+
+Browser sessions 0 live · workload identities 1 (matches the runtime) · secrets 2
+(`brightdata-franklin-tn`, `brightdata-brentwood-tn`, both in use) · no stray repos under
+`aeo-groundtruth/*`. Note `secretsmanager:ListSecrets` is denied, so secrets must be
+checked by name with `describe-secret`.
